@@ -24,11 +24,6 @@ from . import config
 _cache: dict = {}  # keys: access_token, expires_at
 
 
-def _free_port() -> int:
-    """Ask the OS for a free port by binding to port 0."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("localhost", 0))
-        return s.getsockname()[1]
 
 
 def _exchange_code(cfg: dict, code: str, redirect_uri: str) -> dict:
@@ -67,10 +62,33 @@ def _refresh_access_token(cfg: dict, refresh_token: str) -> dict:
 
 def browser_login(cfg: dict) -> None:
     """Open browser, catch callback, exchange code, save tokens."""
-    port = _free_port()
     redirect_uri = cfg["ADOBE_REDIRECT_URI"]
-    # Encode port in state so Vercel relay can forward to the right local port
-    # without URLSearchParams re-encoding the auth code
+
+    received: dict = {}
+
+    class _Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            if parsed.path != "/callback":
+                self.send_response(404)
+                self.end_headers()
+                return
+            params = parse_qs(parsed.query)
+            received["code"]  = params.get("code",  [None])[0]
+            received["error"] = params.get("error", [None])[0]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"<html><body><h2>Login complete. Return to your terminal.</h2></body></html>")
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+
+    # Bind to port 0 — OS assigns a free port atomically, no race condition
+    httpd = HTTPServer(("localhost", 0), _Handler)
+    port  = httpd.server_address[1]
+
     state = f"{port}.{secrets.token_urlsafe(16)}"
 
     authorize_url = config.ADOBE_AUTHORIZE_URL + "?" + urlencode({
@@ -81,31 +99,6 @@ def browser_login(cfg: dict) -> None:
         "state": state,
     })
 
-    received: dict = {}
-    server_ready = threading.Event()
-
-    class _Handler(BaseHTTPRequestHandler):
-        def log_message(self, *args):
-            pass  # suppress request logs
-
-        def do_GET(self):
-            parsed = urlparse(self.path)
-            if parsed.path != "/callback":
-                self.send_response(404)
-                self.end_headers()
-                return
-
-            params = parse_qs(parsed.query)
-            received["code"] = params.get("code", [None])[0]
-            received["error"] = params.get("error", [None])[0]
-
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            self.wfile.write(b"<html><body><h2>Login complete. Return to your terminal.</h2></body></html>")
-            threading.Thread(target=self.server.shutdown, daemon=True).start()
-
-    httpd = HTTPServer(("localhost", port), _Handler)
     server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     server_thread.start()
 
