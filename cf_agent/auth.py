@@ -24,12 +24,11 @@ from . import config
 _cache: dict = {}  # keys: access_token, expires_at
 
 
-def _free_port(start: int = 8080) -> int:
-    for port in range(start, start + 20):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            if s.connect_ex(("localhost", port)) != 0:
-                return port
-    raise RuntimeError("No free port found in range 8080-8099")
+def _free_port() -> int:
+    """Ask the OS for a free port by binding to port 0."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("localhost", 0))
+        return s.getsockname()[1]
 
 
 def _exchange_code(cfg: dict, code: str, redirect_uri: str) -> dict:
