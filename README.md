@@ -92,7 +92,7 @@ IMS org:     ims-na1
 Client ID:   99dd32f5fb3844c9af0e838c84b81e44
 Token:       expires in 84231s
 Scopes:      openid,AdobeID,aem.fragments.management,aem.folders
-Environment: https://author-p193006-e2010299.adobeaemcloud.com/adobe/sites
+Environment: https://author-p<PROGRAM_ID>-e<ENV_ID>.adobeaemcloud.com/adobe/sites
 ```
 
 ---
@@ -109,12 +109,12 @@ cf-agent env list
 
 Example output:
 ```
-  1. PROD      https://author-p193006-e2010455.adobeaemcloud.com/adobe/sites
-  2. STAGE     https://author-p193006-e2010299.adobeaemcloud.com/adobe/sites (current)
-  3. DEV       https://author-p193006-e2010379.adobeaemcloud.com/adobe/sites
-  4. MW-PROD   https://author-p180958-e1901212.adobeaemcloud.com/adobe/sites
-  5. MW-STAGE  https://author-p180958-e1901213.adobeaemcloud.com/adobe/sites
-  6. MW-DEV    https://author-p180958-e1901357.adobeaemcloud.com/adobe/sites
+  1. PROD      https://author-p<PROGRAM_ID>-e<ENV_ID_PROD>.adobeaemcloud.com/adobe/sites
+  2. STAGE     https://author-p<PROGRAM_ID>-e<ENV_ID_STAGE>.adobeaemcloud.com/adobe/sites (current)
+  3. DEV       https://author-p<PROGRAM_ID>-e<ENV_ID_DEV>.adobeaemcloud.com/adobe/sites
+  4. MW-PROD   https://author-p<MW_PROGRAM_ID>-e<ENV_ID_MW_PROD>.adobeaemcloud.com/adobe/sites
+  5. MW-STAGE  https://author-p<MW_PROGRAM_ID>-e<ENV_ID_MW_STAGE>.adobeaemcloud.com/adobe/sites
+  6. MW-DEV    https://author-p<MW_PROGRAM_ID>-e<ENV_ID_MW_DEV>.adobeaemcloud.com/adobe/sites
 ```
 
 ### Switch environment interactively
@@ -132,7 +132,7 @@ cf-agent env current
 ### Set environment manually
 
 ```bash
-cf-agent env use https://author-p193006-e2010455.adobeaemcloud.com/adobe/sites
+cf-agent env use https://author-p<PROGRAM_ID>-e<ENV_ID>.adobeaemcloud.com/adobe/sites
 ```
 
 ---
