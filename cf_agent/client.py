@@ -69,3 +69,42 @@ def request(cfg: dict, method: str, path: str, content_type: str = "application/
     if resp.is_error:
         raise SystemExit(_format_error(resp, method, f"{base}{path}"))
     return resp
+
+
+def resource_exists(cfg: dict, resource_path: str) -> bool:
+    """Check whether an author-tier AEM resource exists."""
+    token = auth.get_token(cfg)
+    base_url = cfg.get("ADOBE_SITES_API_BASE_URL")
+    if not base_url:
+        raise SystemExit(
+            "No AEM environment selected.\n"
+            "Run `cf-agent env select` to choose an environment."
+        )
+
+    base = base_url.rstrip("/")
+    author_root = base.split("/adobe/sites", 1)[0]
+    path = resource_path if resource_path.startswith("/") else f"/{resource_path}"
+    candidate_urls = [f"{author_root}{path}", f"{author_root}{path}.json"]
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-Adobe-Accept-Experimental": "1",
+    }
+
+    for url in candidate_urls:
+        for method in ("HEAD", "GET"):
+            try:
+                resp = httpx.request(method, url, headers=headers, timeout=15)
+            except httpx.HTTPError:
+                continue
+
+            if resp.status_code == 200:
+                return True
+            if resp.status_code in (401, 403):
+                raise SystemExit(
+                    f"Unable to validate resource existence due to permissions: {url}"
+                )
+            if resp.status_code in (404, 405):
+                continue
+
+    return False

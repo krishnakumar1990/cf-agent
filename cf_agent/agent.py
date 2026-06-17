@@ -1,10 +1,13 @@
 """CLI entry point for cf-agent."""
 
 import json
+import re
+from pathlib import Path
 
 import click
 
 from . import auth, config, environments
+from . import client
 from . import tools as t
 
 
@@ -19,6 +22,213 @@ def _cfg():
 
 def _print_json(data):
     click.echo(json.dumps(data, indent=2))
+
+
+def _looks_like_file_path(value: str) -> bool:
+    """Return True when a long-text input looks like a file path."""
+    return (
+        value.startswith(("~/", "./", "../", "/"))
+        or "/" in value
+        or "\\" in value
+    )
+
+
+def _read_markdown_value(value: str) -> str:
+    """Read long-text content from file when the value is a path-like input."""
+    candidate = Path(value.strip("'\"")).expanduser()
+    if candidate.exists() and candidate.is_file():
+        return candidate.read_text(encoding="utf-8")
+    if _looks_like_file_path(value):
+        raise click.ClickException(
+            f"Long-text value looks like a file path but file was not found/readable: {value}"
+        )
+    return value
+
+
+def _model_schema_fields(cfg: dict, model_path: str) -> list[dict]:
+    """Return model schema fields from pre-fetched mapping or API fallback."""
+    schema_fields = environments.MODEL_SCHEMAS.get(model_path, [])
+    if schema_fields:
+        return schema_fields
+
+    # API fallback for model paths not present in pre-fetched schemas.
+    models_data = t.list_models(cfg, path=model_path, limit=50)
+    model_items = models_data.get("items", [])
+    model_item = next((m for m in model_items if m.get("path") == model_path), None)
+    if not model_item:
+        return []
+    model_id = model_item.get("id")
+    if not model_id:
+        return []
+    try:
+        model_schema = t.get_model(cfg, id=model_id)
+    except SystemExit as exc:
+        raise click.ClickException(f"Unable to load model schema for validation: {exc}")
+    return model_schema.get("fields", [])
+
+
+def _schema_map(schema_fields: list[dict]) -> dict[str, dict]:
+    return {f.get("name", ""): f for f in schema_fields if f.get("name")}
+
+
+def _enum_allowed_values(field_def: dict) -> set[str]:
+    raw_values = (
+        field_def.get("values")
+        or field_def.get("enumValues")
+        or field_def.get("allowedValues")
+        or []
+    )
+    allowed = set()
+    for val in raw_values:
+        if isinstance(val, dict):
+            allowed.add(str(val.get("value") or val.get("key") or ""))
+        else:
+            allowed.add(str(val))
+    return {v for v in allowed if v}
+
+
+def _asset_exists(cfg: dict, asset_path: str) -> bool:
+    """Validate that a DAM asset path exists on the active AEM environment."""
+    return client.resource_exists(cfg, asset_path)
+
+
+def _validate_single_value(cfg: dict, field_def: dict, value: str) -> str:
+    """Apply model-level validation rules and return normalized value."""
+    name = field_def.get("name", "")
+    ftype = field_def.get("fieldType") or field_def.get("type", "text")
+    max_len = field_def.get("maxLength") or field_def.get("maxSize")
+    regex = field_def.get("customValidationRegex", "")
+    err_msg = field_def.get("customErrorMessage", f"Invalid value for '{name}'.")
+
+    if ftype == "long-text":
+        value = _read_markdown_value(value)
+
+    if ftype == "boolean" and value.lower() not in ("true", "false"):
+        raise click.ClickException(f"Field '{name}' expects true or false.")
+
+    if max_len and len(value) > int(max_len):
+        raise click.ClickException(
+            f"Field '{name}' exceeds max length {max_len} (got {len(value)})."
+        )
+
+    if regex and not re.match(regex, value):
+        raise click.ClickException(f"Field '{name}': {err_msg}")
+
+    if ftype == "content-reference":
+        root = field_def.get("root", "/content/dam").rstrip("/")
+        if root != "/content/dam" and not value.startswith("/"):
+            value = f"{root}/{value}"
+        if not _asset_exists(cfg, value):
+            raise click.ClickException(f"Referenced asset does not exist in AEM: {value}")
+
+    return value
+
+
+def _validate_field_values(cfg: dict, field_def: dict, values: list[str]) -> list[str]:
+    """Validate one field's values and return normalized values."""
+    name = field_def.get("name", "")
+    multiple = field_def.get("multiple", False)
+    ftype = field_def.get("fieldType") or field_def.get("type", "text")
+
+    if multiple:
+        normalized = [v.strip() for v in values if v is not None and str(v).strip()]
+        if field_def.get("required") and not normalized:
+            raise click.ClickException(f"Field '{name}' is required.")
+    else:
+        first = values[0] if values else ""
+        first = first.strip() if isinstance(first, str) else str(first)
+        if not first and field_def.get("required"):
+            raise click.ClickException(f"Field '{name}' is required.")
+        normalized = [first] if first else []
+
+    if ftype == "enumeration" and normalized:
+        allowed = _enum_allowed_values(field_def)
+        invalid = [v for v in normalized if v not in allowed]
+        if invalid:
+            invalid_list = ", ".join(invalid)
+            raise click.ClickException(
+                f"Field '{name}' has invalid option(s): {invalid_list}."
+            )
+
+    return [_validate_single_value(cfg, field_def, v) for v in normalized]
+
+
+def _validate_cross_field_rules(field_values: dict[str, list[str]], model_path: str):
+    """Validate business rules spanning multiple fields."""
+    availability = (field_values.get("availability") or [""])[0]
+    install_uuid = (field_values.get("installation_uuid") or [""])[0]
+    if availability == "INSTALLABLE" and not install_uuid:
+        raise click.ClickException(
+            "Field 'installation_uuid' is required when availability is INSTALLABLE."
+        )
+
+
+def _normalize_and_validate_fields(
+    cfg: dict,
+    model_path: str,
+    raw_fields: list[dict],
+    *,
+    require_all_required: bool,
+) -> list[dict]:
+    """Validate fields against schema and return normalized API field payload."""
+    schema_fields = _model_schema_fields(cfg, model_path)
+    if not schema_fields:
+        raise click.ClickException(
+            f"Could not load schema for model '{model_path}'. Cannot validate field names/values."
+        )
+
+    schema = _schema_map(schema_fields)
+    normalized: list[dict] = []
+    by_name: dict[str, list[str]] = {}
+
+    for field in raw_fields:
+        name = (field.get("name") or "").strip()
+        if not name:
+            raise click.ClickException("Field entries must include a non-empty 'name'.")
+        if name not in schema:
+            raise click.ClickException(f"Unknown field name '{name}' for model '{model_path}'.")
+
+        field_def = schema[name]
+        raw_values = field.get("values")
+        if raw_values is None:
+            value = field.get("value")
+            raw_values = [value] if value is not None else []
+
+        cast_values = [str(v) for v in raw_values if v is not None]
+        if field_def.get("multiple") and len(cast_values) == 1 and "," in cast_values[0]:
+            cast_values = [v.strip() for v in cast_values[0].split(",")]
+        cleaned_values = _validate_field_values(cfg, field_def, cast_values)
+        by_name[name] = cleaned_values
+
+        entry = {
+            "name": name,
+            "type": field_def.get("fieldType") or field_def.get("type", "text"),
+            "values": cleaned_values,
+        }
+        if entry["type"] == "long-text" and field_def.get("mimeType"):
+            entry["mimeType"] = field_def["mimeType"]
+        normalized.append(entry)
+
+    if require_all_required:
+        missing = [
+            f.get("name")
+            for f in schema_fields
+            if f.get("required") and not by_name.get(f.get("name", ""))
+        ]
+        if missing:
+            raise click.ClickException(
+                f"Missing required field(s): {', '.join(sorted(missing))}."
+            )
+
+    _validate_cross_field_rules(by_name, model_path)
+    return normalized
+
+
+def _validate_slug_or_fail(slug: str, *, field_label: str = "slug"):
+    if not re.match(r"^[a-z0-9]+(?:-[a-z0-9]+)*$", slug or ""):
+        raise click.ClickException(
+            f"{field_label} must be lowercase kebab-case (e.g. my-plugin-name)."
+        )
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -322,15 +532,14 @@ def _prompt_field_value(field: dict) -> str | None:
                     click.echo("  This field is required.")
                     continue
                 return None
-            # Treat as a file path if it looks like one (strip accidental surrounding quotes)
-            from pathlib import Path
-            candidate = Path(value.strip("'\"")).expanduser()
-            if candidate.exists() and candidate.is_file():
-                content = candidate.read_text(encoding="utf-8")
-                click.echo(f"  Read {len(content)} characters from {candidate}")
-                return content
-            # Otherwise treat as inline content
-            return value
+            try:
+                content = _read_markdown_value(value)
+            except click.ClickException as exc:
+                click.echo(f"  {exc.format_message()}")
+                continue
+            if content != value:
+                click.echo("  Loaded markdown content from file.")
+            return content
 
     # All other types — text prompt with hints and validation
     import re
@@ -445,7 +654,13 @@ def _interactive_create(cfg) -> dict:
         default=default_parent if default_parent else None,
         prompt_suffix=" [default shown, Enter to accept]: " if default_parent else ": ",
     )
-    name = click.prompt("Fragment name (slug, no spaces)")
+    while True:
+        name = click.prompt("Fragment name (slug, kebab-case)").strip()
+        try:
+            _validate_slug_or_fail(name, field_label="Fragment name")
+            break
+        except click.ClickException as exc:
+            click.echo(exc.format_message())
 
     # Title — validate based on schema rules
     title_req_tag = " (required)" if title_required else " (optional, Enter to skip)"
@@ -479,6 +694,7 @@ def _interactive_create(cfg) -> dict:
 
     return {
         "parentPath": parent_path,
+        "modelPath":  model_path,
         "modelId":    model_id,
         "name":       name,
         "title":      title or None,
@@ -486,38 +702,23 @@ def _interactive_create(cfg) -> dict:
     }
 
 
-def _build_fields_from_args(field_args: tuple, model_path: str) -> list:
-    """Convert -f name=value flags to the API fields array using pre-fetched schema for types."""
-    from pathlib import Path
-
-    schema_map = {f["name"]: f for f in environments.MODEL_SCHEMAS.get(model_path, [])}
-    fields_list = []
+def _build_fields_from_args(cfg: dict, field_args: tuple, model_path: str, *, require_all_required: bool) -> list:
+    """Convert -f name=value flags to validated API fields array."""
+    raw_fields = []
     for arg in field_args:
+        if "=" not in arg:
+            raise click.ClickException(f"Invalid -f/--field value '{arg}'. Expected NAME=VALUE.")
         name, _, value = arg.partition("=")
-        name  = name.strip()
+        name = name.strip()
         value = value.strip().strip("'\"")
-        field_def = schema_map.get(name, {})
-        ftype    = field_def.get("type", "text")
-        multiple = field_def.get("multiple", False)
+        raw_fields.append({"name": name, "values": [value]})
 
-        # For long-text fields, treat value as a file path if the file exists
-        if ftype == "long-text":
-            candidate = Path(value).expanduser()
-            if candidate.exists() and candidate.is_file():
-                value = candidate.read_text(encoding="utf-8")
-
-        # Apply path prefix for content-reference fields with a specific folder
-        elif ftype == "content-reference":
-            root = field_def.get("root", "/content/dam").rstrip("/")
-            if root != "/content/dam" and not value.startswith("/"):
-                value = f"{root}/{value}"
-
-        values_list = [v.strip() for v in value.split(",")] if multiple else [value]
-        entry = {"name": name, "type": ftype, "values": values_list}
-        if ftype == "long-text" and field_def.get("mimeType"):
-            entry["mimeType"] = field_def["mimeType"]
-        fields_list.append(entry)
-    return fields_list
+    return _normalize_and_validate_fields(
+        cfg,
+        model_path,
+        raw_fields,
+        require_all_required=require_all_required,
+    )
 
 
 @fragments.command("create")
@@ -542,23 +743,50 @@ def create_fragment(interactive, parent_path, model_path, name, field_args, fiel
 
     if interactive:
         params = _interactive_create(cfg)
+        model_path = params.get("modelPath", "")
+        _validate_slug_or_fail(params.get("name", ""), field_label="Fragment name")
+        params["fields"] = _normalize_and_validate_fields(
+            cfg,
+            model_path,
+            params.get("fields") or [],
+            require_all_required=True,
+        )
     else:
         if not parent_path or not model_path or not name:
             raise click.UsageError(
                 "Requires --parent-path, --model-path, and --name. Use -i for interactive mode."
             )
+        _validate_slug_or_fail(name, field_label="Fragment name")
         import base64
         model_id_enc = base64.urlsafe_b64encode(model_path.encode()).decode().rstrip("=")
 
         if field_args:
-            parsed_fields = _build_fields_from_args(field_args, model_path)
+            parsed_fields = _build_fields_from_args(
+                cfg,
+                field_args,
+                model_path,
+                require_all_required=True,
+            )
         elif fields:
             try:
                 parsed_fields = json.loads(fields)
             except json.JSONDecodeError as e:
                 raise click.ClickException(f"Invalid JSON for --fields: {e}")
+            if not isinstance(parsed_fields, list):
+                raise click.ClickException("--fields must be a JSON array of field objects.")
+            parsed_fields = _normalize_and_validate_fields(
+                cfg,
+                model_path,
+                parsed_fields,
+                require_all_required=True,
+            )
         else:
-            parsed_fields = None
+            parsed_fields = _normalize_and_validate_fields(
+                cfg,
+                model_path,
+                [],
+                require_all_required=True,
+            )
 
         params = {
             "parentPath": parent_path,
@@ -568,6 +796,7 @@ def create_fragment(interactive, parent_path, model_path, name, field_args, fiel
             "fields":     parsed_fields,
         }
 
+    params.pop("modelPath", None)
     data = t.create_fragment(cfg, **params)
     if as_json:
         _print_json(data)
@@ -598,49 +827,117 @@ def update_fragment(id, title, field_args, patch, as_json):
         raise click.ClickException("Could not retrieve ETag for fragment.")
 
     patch_ops = []
+    model_path = fragment.get("model", {}).get("path", "")
+    schema_fields = _model_schema_fields(cfg, model_path)
+    schema = _schema_map(schema_fields)
+    fragment_fields = fragment.get("fields", [])
+    field_index = {f.get("name"): i for i, f in enumerate(fragment_fields) if f.get("name")}
+    effective_values = {
+        f.get("name"): [str(v) for v in (f.get("values") or [])]
+        for f in fragment_fields
+        if f.get("name")
+    }
 
     if title:
         patch_ops.append({"op": "replace", "path": "/title", "value": title})
 
     if field_args:
-        from pathlib import Path as _Path
-        model_path   = fragment.get("model", {}).get("path", "")
-        schema_map   = {f["name"]: f for f in environments.MODEL_SCHEMAS.get(model_path, [])}
-        field_index  = {f["name"]: i for i, f in enumerate(fragment.get("fields", []))}
-
-        for arg in field_args:
-            name, _, value = arg.partition("=")
-            name  = name.strip()
-            value = value.strip().strip("'\"")
-            field_def = schema_map.get(name, {})
-            ftype     = field_def.get("type", "text")
-            multiple  = field_def.get("multiple", False)
-
-            if ftype == "long-text":
-                candidate = _Path(value).expanduser()
-                if candidate.exists() and candidate.is_file():
-                    value = candidate.read_text(encoding="utf-8")
-            elif ftype == "content-reference":
-                root = field_def.get("root", "/content/dam").rstrip("/")
-                if root != "/content/dam" and not value.startswith("/"):
-                    value = f"{root}/{value}"
-
-            values_list = [v.strip() for v in value.split(",")] if multiple else [value]
-
+        normalized_fields = _build_fields_from_args(
+            cfg,
+            field_args,
+            model_path,
+            require_all_required=False,
+        )
+        for entry in normalized_fields:
+            name = entry["name"]
             if name in field_index:
                 idx = field_index[name]
-                patch_ops.append({"op": "replace", "path": f"/fields/{idx}/values", "value": values_list})
+                patch_ops.append({"op": "replace", "path": f"/fields/{idx}/values", "value": entry["values"]})
             else:
-                entry = {"name": name, "type": ftype, "values": values_list}
-                if ftype == "long-text" and field_def.get("mimeType"):
-                    entry["mimeType"] = field_def["mimeType"]
                 patch_ops.append({"op": "add", "path": "/fields/-", "value": entry})
+            effective_values[name] = entry["values"]
 
     if patch:
         try:
-            patch_ops.extend(json.loads(patch))
+            raw_patch_ops = json.loads(patch)
         except json.JSONDecodeError as e:
             raise click.ClickException(f"Invalid JSON for --patch: {e}")
+        if not isinstance(raw_patch_ops, list):
+            raise click.ClickException("--patch must be a JSON array of patch operations.")
+
+        for op in raw_patch_ops:
+            if not isinstance(op, dict):
+                raise click.ClickException("Each --patch operation must be a JSON object.")
+            op_type = op.get("op")
+            path = op.get("path", "")
+            if op_type not in ("add", "replace", "remove", "move", "copy", "test"):
+                raise click.ClickException(f"Invalid patch operation '{op_type}'.")
+
+            match_values = re.match(r"^/fields/(\d+)/values$", path)
+            match_field = re.match(r"^/fields/(\d+)$", path)
+
+            if path == "/fields/-" and op_type == "add":
+                value = op.get("value")
+                if not isinstance(value, dict):
+                    raise click.ClickException("Patch add at /fields/- must include a field object value.")
+                normalized = _normalize_and_validate_fields(
+                    cfg,
+                    model_path,
+                    [value],
+                    require_all_required=False,
+                )[0]
+                op = {**op, "value": normalized}
+                effective_values[normalized["name"]] = normalized["values"]
+
+            elif match_values and op_type in ("add", "replace"):
+                idx = int(match_values.group(1))
+                if idx >= len(fragment_fields):
+                    raise click.ClickException(f"Patch path '{path}' references unknown field index.")
+                field_name = fragment_fields[idx].get("name", "")
+                if field_name not in schema:
+                    raise click.ClickException(f"Unknown model field in patch index {idx}: '{field_name}'.")
+                raw_values = op.get("value")
+                if isinstance(raw_values, list):
+                    values_input = [str(v) for v in raw_values]
+                elif raw_values is None:
+                    values_input = []
+                else:
+                    values_input = [str(raw_values)]
+                normalized_values = _validate_field_values(cfg, schema[field_name], values_input)
+                op = {**op, "value": normalized_values}
+                effective_values[field_name] = normalized_values
+
+            elif match_values and op_type == "remove":
+                idx = int(match_values.group(1))
+                if idx >= len(fragment_fields):
+                    raise click.ClickException(f"Patch path '{path}' references unknown field index.")
+                field_name = fragment_fields[idx].get("name", "")
+                effective_values[field_name] = []
+
+            elif match_field and op_type in ("add", "replace"):
+                value = op.get("value")
+                if not isinstance(value, dict):
+                    raise click.ClickException(f"Patch operation for '{path}' must include a field object value.")
+                normalized = _normalize_and_validate_fields(
+                    cfg,
+                    model_path,
+                    [value],
+                    require_all_required=False,
+                )[0]
+                op = {**op, "value": normalized}
+                effective_values[normalized["name"]] = normalized["values"]
+
+            elif match_field and op_type == "remove":
+                idx = int(match_field.group(1))
+                if idx >= len(fragment_fields):
+                    raise click.ClickException(f"Patch path '{path}' references unknown field index.")
+                field_name = fragment_fields[idx].get("name", "")
+                if field_name:
+                    effective_values.pop(field_name, None)
+
+            patch_ops.append(op)
+
+    _validate_cross_field_rules(effective_values, model_path)
 
     if not patch_ops:
         raise click.UsageError("Provide at least one of: --title, -f name=value, or --patch.")
@@ -650,6 +947,73 @@ def update_fragment(id, title, field_args, patch, as_json):
         _print_json(data)
         return
     click.echo(f"Updated: {data.get('id')}  {data.get('path')}")
+
+
+@fragments.command("validate")
+@click.option("--model-path", required=True, help="Content Fragment Model path")
+@click.option("--name", default=None, help="Fragment name (slug) to validate")
+@click.option("-f", "--field", "field_args", multiple=True, metavar="NAME=VALUE",
+              help="Field value as name=value. Repeatable. Multi-value: comma-separate.")
+@click.option("--fields", default=None, help="Fields as a raw JSON array (advanced)")
+@click.option("--partial", is_flag=True,
+              help="Allow partial payloads (skip required-field completeness checks).")
+@click.option("--json", "as_json", is_flag=True, help="Output raw JSON")
+def validate_fragment_payload(model_path, name, field_args, fields, partial, as_json):
+    """Dry-run validate fragment payload against model rules without writing to AEM."""
+    cfg = _cfg()
+
+    if name:
+        _validate_slug_or_fail(name, field_label="Fragment name")
+
+    if field_args and fields:
+        raise click.UsageError("Use either -f/--field or --fields, not both.")
+
+    if field_args:
+        normalized_fields = _build_fields_from_args(
+            cfg,
+            field_args,
+            model_path,
+            require_all_required=not partial,
+        )
+    elif fields:
+        try:
+            parsed_fields = json.loads(fields)
+        except json.JSONDecodeError as e:
+            raise click.ClickException(f"Invalid JSON for --fields: {e}")
+        if not isinstance(parsed_fields, list):
+            raise click.ClickException("--fields must be a JSON array of field objects.")
+        normalized_fields = _normalize_and_validate_fields(
+            cfg,
+            model_path,
+            parsed_fields,
+            require_all_required=not partial,
+        )
+    else:
+        normalized_fields = _normalize_and_validate_fields(
+            cfg,
+            model_path,
+            [],
+            require_all_required=not partial,
+        )
+
+    result = {
+        "status": "ok",
+        "modelPath": model_path,
+        "name": name,
+        "partial": partial,
+        "fields": normalized_fields,
+    }
+    if as_json:
+        _print_json(result)
+        return
+
+    click.echo("Validation passed.")
+    click.echo(f"Model:  {model_path}")
+    if name:
+        click.echo(f"Name:   {name}")
+    click.echo(f"Fields: {len(normalized_fields)}")
+    if partial:
+        click.echo("Mode:   partial (required-field completeness not enforced)")
 
 
 @fragments.command("delete")
