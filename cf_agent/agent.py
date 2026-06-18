@@ -231,6 +231,45 @@ def _validate_slug_or_fail(slug: str, *, field_label: str = "slug"):
         )
 
 
+def _check_duplicate_slug(
+    cfg: dict,
+    slug: str,
+    model_path: str,
+    search_folder: str = "",
+    *,
+    exclude_fragment_id: str = "",
+) -> None:
+    """Raise ClickException if another fragment in AEM already carries this slug value."""
+    folder = search_folder.rstrip("/") or environments.MODEL_DEFAULTS.get(model_path, "")
+    try:
+        results = t.search_fragments(cfg, query=slug, path=folder or None, limit=50)
+    except (Exception, SystemExit):
+        return  # any search failure must not block the create/update
+
+    for fragment in results.get("items", []):
+        if exclude_fragment_id and fragment.get("id") == exclude_fragment_id:
+            continue
+
+        frag_path = fragment.get("path", "")
+
+        # Prefer exact slug-field check when the search response includes field data.
+        frag_fields = fragment.get("fields", [])
+        if frag_fields:
+            slug_field = next((f for f in frag_fields if f.get("name") == "slug"), None)
+            if slug_field and slug in (slug_field.get("values") or []):
+                raise click.ClickException(
+                    f"Slug '{slug}' is already in use by an existing fragment: {frag_path}\n"
+                    "Choose a unique slug."
+                )
+        else:
+            # Fall back: the JCR node name (last path segment) equals the slug in practice.
+            if frag_path.rstrip("/").endswith(f"/{slug}"):
+                raise click.ClickException(
+                    f"Slug '{slug}' is already in use by an existing fragment: {frag_path}\n"
+                    "Choose a unique slug."
+                )
+
+
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 @click.group()
@@ -797,6 +836,17 @@ def create_fragment(interactive, parent_path, model_path, name, field_args, fiel
         }
 
     params.pop("modelPath", None)
+
+    # Duplicate-slug guard: search AEM before writing.
+    slug_entry = next((f for f in (params.get("fields") or []) if f.get("name") == "slug"), None)
+    if slug_entry and slug_entry.get("values"):
+        _check_duplicate_slug(
+            cfg,
+            slug_entry["values"][0],
+            model_path,
+            params.get("parentPath", ""),
+        )
+
     data = t.create_fragment(cfg, **params)
     if as_json:
         _print_json(data)
@@ -848,6 +898,17 @@ def update_fragment(id, title, field_args, patch, as_json):
             model_path,
             require_all_required=False,
         )
+        # Duplicate-slug guard: only fires when the slug field is being changed.
+        for entry in normalized_fields:
+            if entry["name"] == "slug" and entry.get("values"):
+                frag_parent = "/".join(fragment.get("path", "").rstrip("/").split("/")[:-1])
+                _check_duplicate_slug(
+                    cfg,
+                    entry["values"][0],
+                    model_path,
+                    frag_parent,
+                    exclude_fragment_id=id,
+                )
         for entry in normalized_fields:
             name = entry["name"]
             if name in field_index:
