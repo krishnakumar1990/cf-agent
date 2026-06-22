@@ -31,11 +31,32 @@ Supports interactive guided mode and one-liner commands for creating, reading, u
 
 Requires Python 3.10 or later.
 
+### Recommended: install into a virtual environment
+
+Using a virtual environment keeps `cf-agent` isolated from your system Python and avoids dependency conflicts.
+
+```bash
+# Create and activate a virtual environment
+python3 -m venv ~/.venvs/cf-agent
+source ~/.venvs/cf-agent/bin/activate
+
+# Install cf-agent
+pip install "git+https://github.com/krishnakumar1990/cf-agent.git"
+```
+
+Add the activation line to your shell profile (e.g. `~/.zshrc` or `~/.bashrc`) so the environment is active in every new terminal:
+
+```bash
+echo 'source ~/.venvs/cf-agent/bin/activate' >> ~/.zshrc
+```
+
+### System-wide install (not recommended)
+
 ```bash
 pip install "git+https://github.com/krishnakumar1990/cf-agent.git"
 ```
 
-Verify the installation:
+### Verify the installation
 
 ```bash
 cf-agent --help
@@ -298,8 +319,21 @@ cf-agent fragments create \
 | `agent_capabilities` | Plugin | enumeration (multi) | e.g. `Ambient Agent` |
 | `content_guide` | Both | long-text | File path to a `.md` file, e.g. `~/Desktop/guide.md` |
 | `video` | Both | text | YouTube, Vimeo, or Loom URL |
-| `installation_uuid` | Both | text | Connector: 32 hex chars · Plugin: full UUID format |
+| `installation_uuid` | Both | text | Connector: 32 hex chars · Plugin: full UUID format — **required** when `availability=INSTALLABLE` |
 | `reviewRequired` | Both | enumeration | `true` to send for review and lock |
+
+#### Validation
+
+Before writing to AEM, `cf-agent` validates every field against the live model schema:
+
+- **Required fields** — an error is raised if any required field is missing.
+- **Enumeration values** — invalid options are rejected with the list of allowed values.
+- **Max length** — text fields that exceed their configured limit are caught early.
+- **Regex** — fields with a custom validation pattern are checked client-side.
+- **Content references** (`logo`) — the DAM asset path is verified to exist in AEM before the fragment is created.
+- **Slug format** — the fragment name must be lowercase kebab-case (e.g. `my-connector`).
+- **Duplicate slugs** — AEM is searched for an existing fragment with the same slug before writing. If one is found, the command exits with an error and the conflicting path.
+- **Cross-field rules** — `installation_uuid` is required when `availability` is `INSTALLABLE`.
 
 **Multi-value fields** — comma-separate values in a single `-f` flag:
 ```bash
@@ -478,8 +512,9 @@ Useful for debugging 403 errors — checks whether the token's IMS org matches t
 
 ## Upgrading
 
-Pull the latest version from GitHub:
+Pull the latest version from GitHub. If you installed into a virtual environment, activate it first:
 
 ```bash
+source ~/.venvs/cf-agent/bin/activate
 pip install --upgrade "git+https://github.com/krishnakumar1990/cf-agent.git"
 ```
