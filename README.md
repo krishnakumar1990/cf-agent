@@ -48,6 +48,7 @@ See [Installation](#installation) and [Authentication](#authentication) below fo
   - [copy](#copy)
   - [variations](#variations)
 - [Models](#models)
+- [Assets](#assets)
 - [Diagnostics](#diagnostics)
 - [Upgrading](#upgrading)
 
@@ -347,7 +348,8 @@ Before writing to AEM, `cf-agent` validates every field against the live model s
 - **Enumeration values** — invalid options are rejected with the list of allowed values.
 - **Max length** — text fields that exceed their configured limit are caught early.
 - **Regex** — fields with a custom validation pattern are checked client-side.
-- **Content references** (`logo`) — the DAM asset path is verified to exist in AEM before the fragment is created.
+- **Content references** (`logo`) — the DAM asset path is verified to exist in AEM before the fragment is created. In interactive mode the logo is checked as soon as you enter it, so a typo can be fixed on the spot. See [`asset exists`](#assets) to check any asset manually.
+- **Content guide asset references** — when a `content_guide` markdown file is supplied, every AEM asset it references (`/content/dam/...` image links, markdown links, and `<img>` tags, including full AEM URLs) is verified to exist in the DAM. Creation is blocked, with the missing paths listed, if any reference is broken.
 - **Slug format** — the fragment name must be lowercase kebab-case (e.g. `my-connector`).
 - **Duplicate slugs** — AEM is searched for an existing fragment with the same slug before writing. If one is found, the command exits with an error and the conflicting path.
 - **Cross-field rules** — `installation_uuid` is required when `availability` is `INSTALLABLE`.
@@ -510,6 +512,70 @@ cf-agent models list
 
 cf-agent models list --path /conf/marketplace/settings/dam/cfm/models
 ```
+
+---
+
+## Assets
+
+Check whether a logo or image exists in the AEM DAM. This uses the AEM Assets Author API (asset search) — the same verification applied automatically to the `logo` field and to any `/content/dam/...` references inside a content guide during [`fragments create`](#create).
+
+### exists
+
+```bash
+cf-agent asset exists <ASSET_REF> [--logo | --image | --root <DAM_PATH>] [--json]
+```
+
+`ASSET_REF` may be a **full DAM path**, or a **bare file name** when one of the folder flags is supplied:
+
+| Flag | Resolves a bare name against |
+| --- | --- |
+| `--logo` | `/content/dam/marketplace/logos` |
+| `--image` | `/content/dam/marketplace/images` |
+| `--root <DAM_PATH>` | the folder you specify (e.g. `/content/dam/marketplace/screenshots`) |
+
+Only one of `--logo`, `--image`, or `--root` may be used at a time. A bare name with none of them is rejected.
+
+**Examples:**
+
+```bash
+# Bare file name resolved against the logos folder
+cf-agent asset exists smartsheet.png --logo
+
+# Bare file name resolved against the images folder
+cf-agent asset exists banner.png --image
+
+# Full DAM path (no flag needed)
+cf-agent asset exists /content/dam/marketplace/logos/smartsheet.png
+
+# Any other folder
+cf-agent asset exists diagram.png --root /content/dam/marketplace/screenshots
+
+# Machine-readable output
+cf-agent asset exists smartsheet.png --logo --json
+```
+
+**Example output:**
+
+```
+✓ Asset exists: /content/dam/marketplace/logos/smartsheet.png
+```
+
+```json
+{
+  "path": "/content/dam/marketplace/logos/smartsheet.png",
+  "exists": true
+}
+```
+
+**Exit codes:** `0` if the asset exists, `1` if it does not — so the command can be used directly in scripts:
+
+```bash
+if cf-agent asset exists smartsheet.png --logo; then
+  echo "Logo is present"
+fi
+```
+
+> **Note:** requires the access token to carry the `aem.assets.author` scope. Without it the Assets API returns 403 and the check fails loudly rather than silently passing.
 
 ---
 

@@ -460,6 +460,70 @@ def whoami():
     _row("Environment:", env_url)
 
 
+# ── asset group ─────────────────────────────────────────────────────────────────
+
+# DAM folders for marketplace assets (logos matches the connector model's logo field root).
+LOGO_ROOT = "/content/dam/marketplace/logos"
+IMAGE_ROOT = "/content/dam/marketplace/images"
+
+
+@cli.group()
+def asset():
+    """Check assets in the AEM DAM."""
+
+
+@asset.command("exists")
+@click.argument("asset_ref")
+@click.option("--logo", is_flag=True, help=f"Resolve ASSET_REF against the marketplace logos folder ({LOGO_ROOT}).")
+@click.option("--image", is_flag=True, help=f"Resolve ASSET_REF against the marketplace images folder ({IMAGE_ROOT}).")
+@click.option("--root", default=None, metavar="DAM_PATH", help="DAM folder to resolve a bare file name against (e.g. /content/dam/marketplace/screenshots).")
+@click.option("--json", "as_json", is_flag=True, help="Output raw JSON")
+def asset_exists(asset_ref, logo, image, root, as_json):
+    """Check whether a logo or image exists in the AEM DAM.
+
+    ASSET_REF may be a full DAM path (e.g. /content/dam/marketplace/logos/foo.png),
+    or a bare file name when --logo, --image, or --root is supplied.
+
+    Exits 0 if the asset exists, 1 if it does not — handy for scripting.
+    """
+    cfg = _cfg()
+
+    if sum(bool(x) for x in (logo, image, root)) > 1:
+        raise click.ClickException("Use only one of --logo, --image, or --root.")
+
+    ref = asset_ref.strip()
+    if root:
+        base = root.rstrip("/")
+    elif logo:
+        base = LOGO_ROOT
+    elif image:
+        base = IMAGE_ROOT
+    else:
+        base = None
+
+    if ref.startswith("/"):
+        path = ref
+    elif base:
+        path = f"{base}/{ref}"
+    else:
+        raise click.ClickException(
+            "Provide a full DAM path (e.g. /content/dam/marketplace/logos/foo.png), "
+            "or a file name together with --logo, --image, or --root."
+        )
+
+    exists = client.resource_exists(cfg, path)
+
+    if as_json:
+        _print_json({"path": path, "exists": exists})
+    elif exists:
+        _success(f"✓ Asset exists: {path}")
+    else:
+        _failure(f"✗ Asset not found: {path}")
+
+    if not exists:
+        raise SystemExit(1)
+
+
 # ── env group ─────────────────────────────────────────────────────────────────
 
 @cli.group()
