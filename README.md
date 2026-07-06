@@ -76,12 +76,6 @@ Add the activation line to your shell profile (e.g. `~/.zshrc` or `~/.bashrc`) s
 echo 'source ~/.venvs/cf-agent/bin/activate' >> ~/.zshrc
 ```
 
-### System-wide install (not recommended)
-
-```bash
-pip install "git+https://github.com/krishnakumar1990/cf-agent.git"
-```
-
 ### Verify the installation
 
 ```bash
@@ -156,12 +150,9 @@ cf-agent env list
 
 Example output:
 ```
-  1. PROD      https://author-p<PROGRAM_ID>-e<ENV_ID_PROD>.adobeaemcloud.com/adobe/sites
-  2. STAGE     https://author-p<PROGRAM_ID>-e<ENV_ID_STAGE>.adobeaemcloud.com/adobe/sites (current)
-  3. DEV       https://author-p<PROGRAM_ID>-e<ENV_ID_DEV>.adobeaemcloud.com/adobe/sites
-  4. MW-PROD   https://author-p<MW_PROGRAM_ID>-e<ENV_ID_MW_PROD>.adobeaemcloud.com/adobe/sites
-  5. MW-STAGE  https://author-p<MW_PROGRAM_ID>-e<ENV_ID_MW_STAGE>.adobeaemcloud.com/adobe/sites
-  6. MW-DEV    https://author-p<MW_PROGRAM_ID>-e<ENV_ID_MW_DEV>.adobeaemcloud.com/adobe/sites
+  1. NOW Moveworks PROD      https://author-p<PROGRAM_ID>-e<ENV_ID_PROD>.adobeaemcloud.com/adobe/sites
+  2. NOW Moveworks STAGE     https://author-p<PROGRAM_ID>-e<ENV_ID_STAGE>.adobeaemcloud.com/adobe/sites (current)
+  3. NOW Moveworks DEV       https://author-p<PROGRAM_ID>-e<ENV_ID_DEV>.adobeaemcloud.com/adobe/sites
 ```
 
 ### Switch environment interactively
