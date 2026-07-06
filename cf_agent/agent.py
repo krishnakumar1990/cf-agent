@@ -66,6 +66,11 @@ def _field_heading(label: str, ftype: str, required: bool) -> None:
 
 def _looks_like_file_path(value: str) -> bool:
     """Return True when a long-text input looks like a file path."""
+    # Multi-line input is markdown content, never a path — this also prevents
+    # already-loaded content (e.g. a guide containing /content/dam/ image links)
+    # from being mistaken for a path when re-checked during validation.
+    if "\n" in value:
+        return False
     return (
         value.startswith(("~/", "./", "../", "/"))
         or "/" in value
@@ -132,6 +137,43 @@ def _asset_exists(cfg: dict, asset_path: str) -> bool:
     return client.resource_exists(cfg, asset_path)
 
 
+def _extract_dam_asset_refs(markdown_text: str) -> list[str]:
+    """Return the AEM DAM asset paths (/content/dam/...) referenced in markdown.
+
+    Covers markdown images/links — ``![alt](target)`` and ``[text](target)`` —
+    and HTML ``<img src="...">``. Only references that resolve to a DAM path are
+    returned; relative paths and non-AEM external URLs are ignored (we can't
+    verify those against the DAM). Full AEM URLs are accepted — the path is
+    extracted from the ``/content/dam/`` segment onward.
+    """
+    candidates: list[str] = []
+    # Markdown images and links: the optional leading '!' covers both.
+    for m in re.finditer(r"!?\[[^\]]*\]\(\s*<?([^)\s>]+)", markdown_text):
+        candidates.append(m.group(1))
+    # HTML <img src="..."> / src='...'
+    for m in re.finditer(r"""<img[^>]*\bsrc\s*=\s*["']([^"']+)["']""", markdown_text, re.IGNORECASE):
+        candidates.append(m.group(1))
+
+    dam_paths: list[str] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        raw = raw.strip().strip("<>")
+        idx = raw.find("/content/dam/")
+        if idx == -1:
+            continue
+        # Take from /content/dam/ onward, dropping any trailing title/anchor/query.
+        path = raw[idx:].split()[0].split("#")[0].split("?")[0]
+        if path not in seen:
+            seen.add(path)
+            dam_paths.append(path)
+    return dam_paths
+
+
+def _validate_markdown_asset_refs(cfg: dict, markdown_text: str) -> list[str]:
+    """Return the referenced DAM assets that are missing from AEM (empty if all exist)."""
+    return [p for p in _extract_dam_asset_refs(markdown_text) if not _asset_exists(cfg, p)]
+
+
 def _validate_single_value(cfg: dict, field_def: dict, value: str) -> str:
     """Apply model-level validation rules and return normalized value."""
     name = field_def.get("name", "")
@@ -142,6 +184,12 @@ def _validate_single_value(cfg: dict, field_def: dict, value: str) -> str:
 
     if ftype == "long-text":
         value = _read_markdown_value(value)
+        missing = _validate_markdown_asset_refs(cfg, value)
+        if missing:
+            listed = "\n  - ".join(missing)
+            raise click.ClickException(
+                f"Field '{name}' references AEM asset(s) that do not exist in the DAM:\n  - {listed}"
+            )
 
     if ftype == "boolean" and value.lower() not in ("true", "false"):
         raise click.ClickException(f"Field '{name}' expects true or false.")
@@ -622,6 +670,15 @@ def _prompt_field_value(cfg: dict, field: dict) -> str | None:
                 continue
             if content != value:
                 _success("  Loaded markdown content from file.")
+            # Verify any AEM asset/image references inside the markdown exist now,
+            # so a broken link can be fixed before the whole form is submitted.
+            missing = _validate_markdown_asset_refs(cfg, content)
+            if missing:
+                _failure("  The markdown references AEM asset(s) not found in the DAM:")
+                for p in missing:
+                    _failure(f"    - {p}")
+                _hint("  Fix the reference(s) in the file, then re-enter the path.")
+                continue
             return content
 
     # All other types — text prompt with hints and validation
