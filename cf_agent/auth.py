@@ -17,6 +17,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlencode, urlparse
 
+import click
 import httpx
 
 from . import config
@@ -102,7 +103,7 @@ def browser_login(cfg: dict) -> None:
     server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     server_thread.start()
 
-    print(f"Opening browser for Adobe login (listening on port {port})...")
+    click.secho(f"Opening browser for Adobe login (listening on port {port})...", fg="bright_black")
     webbrowser.open(authorize_url)
     httpd._BaseServer__is_shut_down.wait(timeout=120)
 
@@ -111,7 +112,7 @@ def browser_login(cfg: dict) -> None:
     if not received.get("code"):
         raise SystemExit("Login timed out or was cancelled.")
 
-    print("Auth code received, exchanging for tokens...")
+    click.secho("Auth code received, exchanging for tokens...", fg="bright_black")
     token_data = _exchange_code(cfg, received["code"], redirect_uri)
 
     access_token = token_data["access_token"]
@@ -121,7 +122,7 @@ def browser_login(cfg: dict) -> None:
 
     config.save_tokens(access_token, refresh_token, expires_at)
     _cache.update({"access_token": access_token, "refresh_token": refresh_token, "expires_at": expires_at})
-    print("Login successful. Tokens saved.")
+    click.secho("Login successful. Tokens saved.", fg="green", bold=True)
     return access_token
 
 

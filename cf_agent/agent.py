@@ -24,6 +24,46 @@ def _print_json(data):
     click.echo(json.dumps(data, indent=2))
 
 
+# ── output styling ──────────────────────────────────────────────────────────────
+# click.secho / click.style automatically strip ANSI colour codes when the output
+# is not a TTY (pipes, redirects, --json), so these are safe to use unconditionally.
+
+def _header(msg: str) -> None:
+    """Section header — bold cyan."""
+    click.secho(msg, fg="cyan", bold=True)
+
+
+def _success(msg: str) -> None:
+    """Success / confirmation — bold green."""
+    click.secho(msg, fg="green", bold=True)
+
+
+def _failure(msg: str) -> None:
+    """Validation error / failure — red."""
+    click.secho(msg, fg="red")
+
+
+def _hint(msg: str) -> None:
+    """Secondary guidance / hint — dim grey."""
+    click.secho(msg, fg="bright_black")
+
+
+def _field_heading(label: str, ftype: str, required: bool) -> None:
+    """Consistent, coloured field prompt heading."""
+    tag = (
+        click.style(" (required)", fg="yellow")
+        if required
+        else click.style(" (optional, Enter to skip)", fg="bright_black")
+    )
+    click.echo(
+        "\n  "
+        + click.style("Field : ", fg="cyan", bold=True)
+        + click.style(label, bold=True)
+        + click.style(f"  [{ftype}]", fg="blue")
+        + tag
+    )
+
+
 def _looks_like_file_path(value: str) -> bool:
     """Return True when a long-text input looks like a file path."""
     return (
@@ -279,11 +319,15 @@ def cli():
 
 # ── auth ──────────────────────────────────────────────────────────────────────
 
+DEFAULT_ADOBE_SCOPES = "AdobeID,aem.folders,aem.assets.author,openid,aem.fragments.management"
+DEFAULT_REDIRECT_URI = "https://aem-agent-callback.vercel.app/callback"
+
+
 @cli.command()
 @click.option("--preset", default=None, type=click.Path(exists=True), help="Path to a shared .env file with pre-filled Adobe credentials.")
 def login(preset):
     """Authenticate via browser (Adobe IMS user OAuth)."""
-    click.echo("Setting up cf-agent credentials.\n")
+    _header("Setting up cf-agent credentials.\n")
 
     pre = {}
     if preset:
@@ -298,14 +342,9 @@ def login(preset):
 
     client_id = pre.get("ADOBE_CLIENT_ID") or click.prompt("Adobe Client ID")
     client_secret = pre.get("ADOBE_CLIENT_SECRET") or click.prompt("Adobe Client Secret", hide_input=True)
-    scopes = pre.get("ADOBE_SCOPES") or click.prompt(
-        "Adobe scopes",
-        default="openid,AdobeID,aem.fragments.management,aem.folders",
-    )
-    redirect_uri = pre.get("ADOBE_REDIRECT_URI") or click.prompt(
-        "Redirect URI (must match Adobe Developer Console)",
-        default="https://aem-agent-callback.vercel.app/callback",
-    )
+    # Scopes and redirect URI use fixed defaults (no prompt); a --preset file can still override them.
+    scopes = pre.get("ADOBE_SCOPES") or DEFAULT_ADOBE_SCOPES
+    redirect_uri = pre.get("ADOBE_REDIRECT_URI") or DEFAULT_REDIRECT_URI
 
     cfg_values = {
         "ADOBE_CLIENT_ID": client_id,
@@ -314,7 +353,7 @@ def login(preset):
         "ADOBE_REDIRECT_URI": redirect_uri,
     }
     config.save_config(cfg_values)
-    click.echo("Credentials saved.\n")
+    _success("Credentials saved.\n")
 
     cfg = config.load_config()
     auth.browser_login(cfg)
@@ -322,7 +361,7 @@ def login(preset):
     sites_url = environments.prompt_environment_selection()
     cfg_values["ADOBE_SITES_API_BASE_URL"] = sites_url
     config.save_config(cfg_values)
-    click.echo("Environment saved.\n")
+    _success("Environment saved.\n")
 
 
 @cli.command()
@@ -357,15 +396,20 @@ def whoami():
     client   = cfg.get("ADOBE_CLIENT_ID", "")
     env_url  = cfg.get("ADOBE_SITES_API_BASE_URL", "none selected")
 
-    click.echo(f"User:        {email}")
-    click.echo(f"IMS org:     {org}")
-    click.echo(f"Client ID:   {client}")
+    def _row(k, v):
+        click.echo(click.style(f"{k:<12}", fg="cyan", bold=True) + str(v))
+
+    _row("User:", email)
+    _row("IMS org:", org)
+    _row("Client ID:", client)
     if exp:
         remaining = int(exp - time.time())
-        status = f"expires in {remaining}s" if remaining > 0 else "EXPIRED"
-        click.echo(f"Token:       {status}")
-    click.echo(f"Scopes:      {scope}")
-    click.echo(f"Environment: {env_url}")
+        if remaining > 0:
+            click.echo(click.style(f"{'Token:':<12}", fg="cyan", bold=True) + click.style(f"expires in {remaining}s", fg="green"))
+        else:
+            click.echo(click.style(f"{'Token:':<12}", fg="cyan", bold=True) + click.style("EXPIRED", fg="red"))
+    _row("Scopes:", scope)
+    _row("Environment:", env_url)
 
 
 # ── env group ─────────────────────────────────────────────────────────────────
@@ -382,8 +426,12 @@ def env_list():
     current = cfg.get("ADOBE_SITES_API_BASE_URL", "")
     click.echo("")
     for i, e in enumerate(environments.ENVIRONMENTS, 1):
-        marker = " (current)" if e["url"] == current else ""
-        click.echo(f"  {i}. {e['label']:<6}  {e['url']}{marker}")
+        marker = click.style("  (current)", fg="green") if e["url"] == current else ""
+        click.echo(
+            "  " + click.style(f"{i}.", fg="cyan")
+            + " " + click.style(f"{e['label']:<6}", bold=True)
+            + click.style(f"  {e['url']}", fg="bright_black") + marker
+        )
 
 
 @env.command("select")
@@ -502,20 +550,17 @@ def _parse_enum_options(raw_values: list) -> list[dict]:
 
 def _prompt_enum(label: str, options: list[dict], required: bool, multiple: bool) -> str | None:
     """Numbered selector for enumeration fields. Returns None if skipped."""
-    req_tag = " (required)" if required else " (optional, Enter to skip)"
-    multi_tag = "  Select one or more numbers separated by commas." if multiple else ""
-
-    click.echo(f"\n  Field : {label}  [enumeration]{req_tag}")
+    _field_heading(label, "enumeration", required)
     for i, opt in enumerate(options, 1):
-        click.echo(f"    {i:>2}. {opt['label']}")
-    if multi_tag:
-        click.echo(multi_tag)
+        click.echo("    " + click.style(f"{i:>2}.", fg="cyan") + f" {opt['label']}")
+    if multiple:
+        _hint("  Select one or more numbers separated by commas.")
 
     while True:
-        raw = click.prompt("  Choice", default="", show_default=False).strip()
+        raw = click.prompt(click.style("  Choice", fg="cyan"), default="", show_default=False).strip()
         if not raw:
             if required:
-                click.echo("  This field is required.")
+                _failure("  This field is required.")
                 continue
             return None
 
@@ -531,11 +576,11 @@ def _prompt_enum(label: str, options: list[dict], required: bool, multiple: bool
         except ValueError:
             pass
 
-        click.echo(f"  Enter a number between 1 and {len(options)}." +
-                   (" Separate multiple with commas." if multiple else ""))
+        _failure(f"  Enter a number between 1 and {len(options)}." +
+                 (" Separate multiple with commas." if multiple else ""))
 
 
-def _prompt_field_value(field: dict) -> str | None:
+def _prompt_field_value(cfg: dict, field: dict) -> str | None:
     """Prompt the user for a single model field value. Returns None if skipped."""
     name     = field.get("name", "")
     label    = field.get("label") or name
@@ -557,75 +602,73 @@ def _prompt_field_value(field: dict) -> str | None:
 
     # Long-text — offer file path or inline
     if ftype == "long-text":
-        req_tag = " (required)" if required else " (optional, Enter to skip)"
-        click.echo(f"\n  Field : {label}  [long-text / markdown]{req_tag}")
+        _field_heading(label, "long-text / markdown", required)
         description = field.get("description", "").strip()
         if description:
-            click.echo(f"  Hint  : {description}")
-        click.echo("  Provide a file path (recommended for markdown, e.g. ~/guide.md).")
-        click.echo("  Pasting multi-line markdown directly may fail due to shell interpretation.")
+            _hint(f"  Hint  : {description}")
+        _hint("  Provide a file path (recommended for markdown, e.g. ~/guide.md).")
+        _hint("  Pasting multi-line markdown directly may fail due to shell interpretation.")
         while True:
-            value = click.prompt("  Value or file path", default="", show_default=False).strip()
+            value = click.prompt(click.style("  Value or file path", fg="cyan"), default="", show_default=False).strip()
             if not value:
                 if required:
-                    click.echo("  This field is required.")
+                    _failure("  This field is required.")
                     continue
                 return None
             try:
                 content = _read_markdown_value(value)
             except click.ClickException as exc:
-                click.echo(f"  {exc.format_message()}")
+                _failure(f"  {exc.format_message()}")
                 continue
             if content != value:
-                click.echo("  Loaded markdown content from file.")
+                _success("  Loaded markdown content from file.")
             return content
 
     # All other types — text prompt with hints and validation
     import re
-    req_tag = " (required)" if required else " (optional, Enter to skip)"
-    click.echo(f"\n  Field : {label}  [{ftype}]{req_tag}")
+    _field_heading(label, ftype, required)
 
     description = field.get("description", "").strip()
     if description:
-        click.echo(f"  Hint  : {description}")
+        _hint(f"  Hint  : {description}")
 
     if ftype == "boolean":
-        click.echo("  Enter: true or false")
+        _hint("  Enter: true or false")
     elif ftype == "content-reference":
         root = field.get("root", "/content/dam").rstrip("/")
         if root != "/content/dam":
-            click.echo(f"  Path prefix: {root}/")
-            click.echo("  Enter the file name only (e.g. my-logo.svg)")
+            _hint(f"  Path prefix: {root}/")
+            _hint("  Enter the file name only (e.g. my-logo.svg)")
     elif ftype == "fragment-reference":
-        click.echo("  Expected: Content Fragment UUID or path")
+        _hint("  Expected: Content Fragment UUID or path")
     elif ftype in ("date", "date-time"):
-        click.echo("  Expected: YYYY-MM-DD  or  YYYY-MM-DDTHH:MM:SSZ")
+        _hint("  Expected: YYYY-MM-DD  or  YYYY-MM-DDTHH:MM:SSZ")
 
     max_len = field.get("maxLength") or field.get("maxSize")
     if max_len:
-        click.echo(f"  Max length: {max_len} characters")
+        _hint(f"  Max length: {max_len} characters")
 
     regex   = field.get("customValidationRegex", "")
     err_msg = field.get("customErrorMessage", "Invalid value.")
 
     while True:
-        value = click.prompt("  Value", default="", show_default=False).strip()
+        value = click.prompt(click.style("  Value", fg="cyan"), default="", show_default=False).strip()
         if not value:
             if required:
-                click.echo("  This field is required.")
+                _failure("  This field is required.")
                 continue
             return None
 
         if ftype == "boolean" and value.lower() not in ("true", "false"):
-            click.echo("  Enter true or false.")
+            _failure("  Enter true or false.")
             continue
 
         if max_len and len(value) > max_len:
-            click.echo(f"  Too long — max {max_len} characters (entered {len(value)}).")
+            _failure(f"  Too long — max {max_len} characters (entered {len(value)}).")
             continue
 
         if regex and not re.match(regex, value):
-            click.echo(f"  {err_msg}")
+            _failure(f"  {err_msg}")
             continue
 
         # Prepend root prefix for content-reference fields with a specific folder
@@ -633,6 +676,11 @@ def _prompt_field_value(field: dict) -> str | None:
             root = field.get("root", "/content/dam").rstrip("/")
             if root != "/content/dam" and not value.startswith("/"):
                 value = f"{root}/{value}"
+            # Verify the asset exists in AEM now, so a typo can be corrected in
+            # place instead of failing after the whole form is filled in.
+            if not _asset_exists(cfg, value):
+                _failure(f"  Asset not found in AEM: {value}. Please enter a valid asset name.")
+                continue
 
         return value
 
@@ -640,22 +688,22 @@ def _prompt_field_value(field: dict) -> str | None:
 def _interactive_create(cfg) -> dict:
     """Walk the user through creating a fragment step by step."""
     # ── pick model ────────────────────────────────────────────────────────────
-    click.echo("\nFetching available models...")
+    _hint("\nFetching available models...")
     models_data = t.list_models(cfg, limit=50)
     model_items = models_data.get("items", [])
     if not model_items:
         raise click.ClickException("No models found on this environment.")
 
-    click.echo("\nAvailable models:")
+    _header("\nAvailable models:")
     for i, m in enumerate(model_items, 1):
         title = m.get("title", "").strip()
         path  = m.get("path", "")
         name  = path.rstrip("/").rsplit("/", 1)[-1]
         label = title if title else name
-        click.echo(f"  {i}. {label}")
+        click.echo("  " + click.style(f"{i}.", fg="cyan") + f" {label}")
 
     while True:
-        raw = click.prompt(f"\nSelect model [1-{len(model_items)}]", default="1")
+        raw = click.prompt(click.style(f"\nSelect model [1-{len(model_items)}]", fg="cyan"), default="1")
         try:
             idx = int(raw)
             if 1 <= idx <= len(model_items):
@@ -663,60 +711,59 @@ def _interactive_create(cfg) -> dict:
                 break
         except ValueError:
             pass
-        click.echo(f"Please enter a number between 1 and {len(model_items)}.")
+        _failure(f"Please enter a number between 1 and {len(model_items)}.")
 
     model_path  = chosen_model["path"]
     model_id    = chosen_model.get("id", "")
     model_label = (chosen_model.get("title") or "").strip() or model_path.rstrip("/").rsplit("/", 1)[-1]
-    click.echo(f"Model: {model_label}")
+    _success(f"Model: {model_label}")
 
     # ── resolve schema: use pre-fetched first, fall back to API ──────────────
     schema_fields: list = environments.MODEL_SCHEMAS.get(model_path, [])
     title_required = True
 
     if schema_fields:
-        click.echo(f"  Schema loaded ({len(schema_fields)} fields, pre-fetched).")
+        _hint(f"  Schema loaded ({len(schema_fields)} fields, pre-fetched).")
     elif model_id:
         try:
             model_schema = t.get_model(cfg, id=model_id)
             schema_fields = model_schema.get("fields", [])
             title_required = model_schema.get("titleRequired", True)
-            click.echo(f"  Schema loaded ({len(schema_fields)} fields, from API).")
+            _hint(f"  Schema loaded ({len(schema_fields)} fields, from API).")
         except SystemExit:
-            click.echo("  (Could not load schema — proceeding without field validation.)")
+            _hint("  (Could not load schema — proceeding without field validation.)")
 
     # ── basic fragment details ────────────────────────────────────────────────
     click.echo("")
     default_parent = environments.MODEL_DEFAULTS.get(model_path, "")
     parent_path = click.prompt(
-        "Parent folder path",
+        click.style("Parent folder path", fg="cyan"),
         default=default_parent if default_parent else None,
         prompt_suffix=" [default shown, Enter to accept]: " if default_parent else ": ",
     )
     while True:
-        name = click.prompt("Fragment name (slug, kebab-case)").strip()
+        name = click.prompt(click.style("Fragment name (slug, kebab-case)", fg="cyan")).strip()
         try:
             _validate_slug_or_fail(name, field_label="Fragment name")
             break
         except click.ClickException as exc:
-            click.echo(exc.format_message())
+            _failure(exc.format_message())
 
     # Title — validate based on schema rules
-    title_req_tag = " (required)" if title_required else " (optional, Enter to skip)"
-    click.echo(f"\n  Fragment title{title_req_tag}")
+    _field_heading("Fragment title", "text", title_required)
     while True:
-        title = click.prompt("  Title", default="", show_default=False).strip()
+        title = click.prompt(click.style("  Title", fg="cyan"), default="", show_default=False).strip()
         if not title and title_required:
-            click.echo("  Title is required for this model.")
+            _failure("  Title is required for this model.")
             continue
         break
 
     # ── field prompts ─────────────────────────────────────────────────────────
     fields_list: list = []
     if schema_fields:
-        click.echo(f"\nEnter values for {len(schema_fields)} field(s):")
+        _header(f"\nEnter values for {len(schema_fields)} field(s):")
         for field in schema_fields:
-            value = _prompt_field_value(field)
+            value = _prompt_field_value(cfg, field)
             if value is None:
                 continue
             ftype    = field.get("fieldType") or field.get("type", "text")
@@ -851,8 +898,8 @@ def create_fragment(interactive, parent_path, model_path, name, field_args, fiel
     if as_json:
         _print_json(data)
         return
-    click.echo(f"\nCreated: {data.get('id')}")
-    click.echo(f"Path:    {data.get('path')}")
+    _success(f"\nCreated: {data.get('id')}")
+    click.echo(click.style("Path:    ", fg="green", bold=True) + f"{data.get('path')}")
 
 
 @fragments.command("update")

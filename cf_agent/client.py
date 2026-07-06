@@ -112,12 +112,29 @@ def _assets_base_url(cfg: dict) -> str:
     return sites_url.rstrip("/").replace("/adobe/sites", "/adobe/assets", 1)
 
 
-def _resource_exists_via_assets_api(token: str, assets_base: str, dam_path: str) -> bool | None:
-    """Use the Assets Author API search endpoint to check DAM asset existence.
+def resource_exists(cfg: dict, resource_path: str) -> bool:
+    """Check whether an author-tier AEM DAM asset exists.
 
-    Returns True/False when the API responds, or None when the call fails so
-    the caller can fall back to the HEAD/GET strategy.
+    Uses the Assets Author API search endpoint (POST /adobe/assets/search) to
+    match the exact DAM path against ``repositoryMetadata.repo:path``. Returns
+    True/False for a definitive answer, and raises a ClickException if the asset
+    cannot be verified (network failure, missing scopes, or any other non-200
+    response) so an unverified path never silently passes validation.
     """
+    token = auth.get_token(cfg)
+    base_url = cfg.get("ADOBE_SITES_API_BASE_URL")
+    if not base_url:
+        raise click.ClickException(
+            "No AEM environment selected. Run `cf-agent env select` to choose an environment."
+        )
+
+    assets_base = _assets_base_url(cfg)
+    if not assets_base:
+        raise click.ClickException(
+            "Could not derive the Assets API URL from the selected environment."
+        )
+
+    path = resource_path if resource_path.startswith("/") else f"/{resource_path}"
     search_url = f"{assets_base}/search"
     headers = {
         "Authorization": f"Bearer {token}",
@@ -128,15 +145,17 @@ def _resource_exists_via_assets_api(token: str, assets_base: str, dam_path: str)
         "query": [
             {
                 # "term" = exact unanalyzed match — prevents fuzzy hits like
-                # workday.svg matching a search for workday1.svg.
+                # workday.svg matching a search for workday1.svg. The Assets
+                # Author API expects each condition as {field: [values]}, so the
+                # DAM path must be wrapped in a list.
                 "term": {
-                    "text": dam_path,
-                    "fields": ["repositoryMetadata.repo:path"],
+                    "repositoryMetadata.repo:path": [path],
                 }
             }
         ],
         "limit": 5,
     }
+
     try:
         resp = httpx.post(
             search_url,
@@ -145,82 +164,19 @@ def _resource_exists_via_assets_api(token: str, assets_base: str, dam_path: str)
             headers=headers,
             timeout=15,
         )
-    except httpx.HTTPError:
-        return None
+    except httpx.HTTPError as exc:
+        raise click.ClickException(
+            f"Could not verify asset path '{resource_path}': "
+            f"failed to reach the AEM Assets API ({exc})."
+        )
 
     if resp.status_code == 200:
         results = resp.json().get("hits", {}).get("results", [])
-        for r in results:
-            meta = r.get("repositoryMetadata", {})
-            if meta.get("repo:path") == dam_path:
-                return True
-        if results:
-            return None
-        return False
-    # 401/403 on the Assets Author API means the OAuth scopes don't cover it.
-    # Fall through to the REST API fallback instead of blocking the operation.
-    return None  # unexpected status or auth gap — let caller fall back
-
-
-def resource_exists(cfg: dict, resource_path: str) -> bool:
-    """Check whether an author-tier AEM DAM resource exists.
-
-    Strategy:
-    1. Assets Author API search (POST /adobe/assets/search) — structured and reliable.
-    2. Fall back to AEM Assets REST API (/api/assets/{path}.json).
-    """
-    token = auth.get_token(cfg)
-    base_url = cfg.get("ADOBE_SITES_API_BASE_URL")
-    if not base_url:
-        raise click.ClickException(
-            "No AEM environment selected. Run `cf-agent env select` to choose an environment."
+        return any(
+            r.get("repositoryMetadata", {}).get("repo:path") == path
+            for r in results
         )
 
-    path = resource_path if resource_path.startswith("/") else f"/{resource_path}"
-
-    # ── Primary: Assets Author API search ────────────────────────────────────
-    assets_base = _assets_base_url(cfg)
-    if assets_base:
-        result = _resource_exists_via_assets_api(token, assets_base, path)
-        if result is not None:
-            return result
-
-    # ── Fallback: AEM Assets REST API (/api/assets/{path}.json) ──────────────
-    # This endpoint is purpose-built for DAM asset management and reliably
-    # returns 404 for non-existent assets. It does NOT suffer from Sling's
-    # path-traversal 200 behaviour (which affects raw /content/dam/ paths).
-    base = base_url.rstrip("/")
-    author_root = base.split("/adobe/sites", 1)[0]
-
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "X-Adobe-Accept-Experimental": "1",
-    }
-
-    if path.startswith("/content/dam/"):
-        relative = path[len("/content/dam/"):]
-        url = f"{author_root}/api/assets/{relative}.json"
-    else:
-        url = f"{author_root}{path}"
-
-    try:
-        resp = httpx.request("GET", url, headers=headers, timeout=15)
-    except httpx.HTTPError:
-        return False
-
-    if resp.status_code == 200:
-        ct = resp.headers.get("content-type", "")
-        if "text/html" in ct:
-            return False
-        return True
-    if resp.status_code in (401, 403):
-        # Both the Assets Author API and the REST API are inaccessible with
-        # the current token scopes. Warn and skip — AEM will validate on write.
-        click.echo(
-            f"Warning: cannot verify asset path '{resource_path}' (API returned 403 — "
-            f"token scopes do not cover asset lookup). AEM may reject at publish time "
-            f"if the path does not exist in DAM.",
-            err=True,
-        )
-        return True
-    return False
+    # Any non-200 (missing scopes, bad request, server error) is a hard failure —
+    # never fail open, or a non-existent asset would slip through validation.
+    raise click.ClickException(_format_error(resp, "POST", search_url))
