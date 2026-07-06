@@ -6,8 +6,34 @@ Supports interactive guided mode and one-liner commands for creating, reading, u
 
 ---
 
+## Quick Start
+
+Copy-paste this single block to create an isolated environment, install `cf-agent`, and log in to AEM. Requires **Python 3.10+**.
+
+```bash
+# 1. Create & activate a virtual environment
+python3 -m venv ~/.venvs/cf-agent
+source ~/.venvs/cf-agent/bin/activate
+
+# 2. Install cf-agent
+pip install "git+https://github.com/krishnakumar1990/cf-agent.git"
+
+# 3. Log in to AEM (opens your browser)
+cf-agent login
+```
+
+During login you'll be prompted for your **Adobe Client ID** and **Client Secret**; a browser then opens for Adobe IMS login, and finally you select an environment (PROD / STAGE / DEV). That's it — you're ready to run commands like `cf-agent fragments create -i`.
+
+> New terminal later? Just re-activate the environment first: `source ~/.venvs/cf-agent/bin/activate`
+> To have it activate automatically in every shell: `echo 'source ~/.venvs/cf-agent/bin/activate' >> ~/.zshrc`
+
+See [Installation](#installation) and [Authentication](#authentication) below for more detail and options.
+
+---
+
 ## Table of Contents
 
+- [Quick Start](#quick-start)
 - [Installation](#installation)
 - [Authentication](#authentication)
 - [Environment Management](#environment-management)
@@ -88,7 +114,7 @@ The browser will open for Adobe IMS login. After completing the login, you will 
 cf-agent login
 ```
 
-You will be prompted for all values including Adobe scopes and redirect URI.
+You will be prompted only for your **Adobe Client ID** and **Adobe Client Secret**. Scopes and the redirect URI use built-in defaults (no prompt), then the browser opens for login and you select an environment. This is the simplest path and needs no `shared.env` file — it's the same command used in the [Quick Start](#quick-start).
 
 ### Logout
 
