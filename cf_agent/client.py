@@ -71,6 +71,19 @@ def request(cfg: dict, method: str, path: str, content_type: str = "application/
     return resp
 
 
+def author_request(cfg: dict, method: str, path: str, **kwargs) -> httpx.Response:
+    """Request an author-tier path OUTSIDE the /adobe/sites CF API (e.g. GraphQL)."""
+    token = auth.get_token(cfg)
+    base_url = cfg.get("ADOBE_SITES_API_BASE_URL")
+    if not base_url:
+        raise SystemExit("No AEM environment selected. Run `cf-agent env select`.")
+    author_root = base_url.rstrip("/").split("/adobe/sites", 1)[0]
+    headers = kwargs.pop("headers", {})
+    headers["Authorization"] = f"Bearer {token}"
+    headers["X-Adobe-Accept-Experimental"] = "1"
+    return httpx.request(method, f"{author_root}{path}", headers=headers, timeout=20, **kwargs)
+
+
 def resource_exists(cfg: dict, resource_path: str) -> bool:
     """Check whether an author-tier AEM resource exists."""
     token = auth.get_token(cfg)

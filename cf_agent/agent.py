@@ -45,26 +45,43 @@ def _read_markdown_value(value: str) -> str:
     return value
 
 
-def _model_schema_fields(cfg: dict, model_path: str) -> list[dict]:
-    """Return model schema fields from pre-fetched mapping or API fallback."""
-    schema_fields = environments.MODEL_SCHEMAS.get(model_path, [])
-    if schema_fields:
-        return schema_fields
+# NOTE: content_type ("connector"/"plugin") is a model-level constant — the model's
+# hidden content_type field carries a fixed value and the marketplace GraphQL derives
+# it automatically from the chosen model. It is NOT a per-fragment field and must not
+# be sent in the create payload (AEM rejects unknown fields). No CLI action needed.
 
-    # API fallback for model paths not present in pre-fetched schemas.
-    models_data = t.list_models(cfg, path=model_path, limit=50)
-    model_items = models_data.get("items", [])
-    model_item = next((m for m in model_items if m.get("path") == model_path), None)
-    if not model_item:
-        return []
-    model_id = model_item.get("id")
-    if not model_id:
-        return []
+
+def _encode_model_id(model_path: str) -> str:
+    """Model IDs are the base64url-encoding of the model path (no padding)."""
+    import base64
+    return base64.urlsafe_b64encode(model_path.encode()).decode().rstrip("=")
+
+
+# Per-process cache so a single command fetches each model schema at most once.
+_SCHEMA_CACHE: dict[str, list[dict]] = {}
+
+
+def _model_schema_fields(cfg: dict, model_path: str) -> list[dict]:
+    """Fetch model schema fields live from AEM — the single source of truth.
+
+    The AEM Content Fragment Model carries every validation rule (required,
+    maxLength, customValidationRegex, enum values, content-reference root,
+    long-text mimeType). The CLI validates against this directly rather than
+    maintaining its own copy, so a rule change in AEM needs no CLI change.
+    """
+    if model_path in _SCHEMA_CACHE:
+        return _SCHEMA_CACHE[model_path]
+
+    model_id = _encode_model_id(model_path)
     try:
         model_schema = t.get_model(cfg, id=model_id)
     except SystemExit as exc:
-        raise click.ClickException(f"Unable to load model schema for validation: {exc}")
-    return model_schema.get("fields", [])
+        raise click.ClickException(
+            f"Unable to load model schema from AEM for '{model_path}': {exc}"
+        )
+    fields = model_schema.get("fields", [])
+    _SCHEMA_CACHE[model_path] = fields
+    return fields
 
 
 def _schema_map(schema_fields: list[dict]) -> dict[str, dict]:
@@ -153,14 +170,68 @@ def _validate_field_values(cfg: dict, field_def: dict, values: list[str]) -> lis
     return [_validate_single_value(cfg, field_def, v) for v in normalized]
 
 
-def _validate_cross_field_rules(field_values: dict[str, list[str]], model_path: str):
-    """Validate business rules spanning multiple fields."""
+# System/brand slug tokens that are common English words — skipped in the
+# name-contains-system check to avoid false positives (e.g. google-calendar).
+_GENERIC_SYSTEM_TOKENS = {
+    "calendar", "drive", "box", "cloud", "graph", "workspace", "service",
+    "desk", "power", "automate", "one", "entra", "intune", "sharepoint",
+    "app", "digitalworkplace",
+}
+
+
+def _validate_cross_field_rules(
+    field_values: dict[str, list[str]], model_path: str, *, is_create: bool = False
+):
+    """Validate business rules spanning multiple fields.
+
+    AEM's model API has no cross-field validation, so these rules are enforced
+    only here (CLI / API path) and, for the UI path, in the authoring behavior
+    JS clientlib. Keep the two in sync.
+
+    Relationship rules (slug↔systems, name↔systems) apply only at creation —
+    slug and systems are immutable afterward, so re-checking them on update would
+    wrongly block edits to legacy fragments.
+    """
     availability = (field_values.get("availability") or [""])[0]
     install_uuid = (field_values.get("installation_uuid") or [""])[0]
-    if availability == "INSTALLABLE" and not install_uuid:
-        raise click.ClickException(
-            "Field 'installation_uuid' is required when availability is INSTALLABLE."
-        )
+
+    if availability == "INSTALLABLE":
+        if not install_uuid:
+            raise click.ClickException(
+                "installation_uuid is required when availability is INSTALLABLE."
+            )
+    elif availability in ("VALIDATED", "IDEA", "BUILT_IN"):
+        if install_uuid:
+            raise click.ClickException(
+                f"installation_uuid must not be set when availability is {availability} "
+                "(only INSTALLABLE assets may carry an installation UUID)."
+            )
+
+    systems = [s for s in (field_values.get("systems") or []) if s]
+    slug = (field_values.get("slug") or [""])[0]
+    name = (field_values.get("marketplace_name") or [""])[0]
+
+    # Plugin-only relationship rules (connectors carry no `systems`).
+    if is_create and systems:
+        # slug must start with one of the plugin's systems, e.g. workday-request-time-off
+        if slug and not any(slug == s or slug.startswith(s + "-") for s in systems):
+            raise click.ClickException(
+                f"Plugin slug '{slug}' must start with one of its systems "
+                f"({', '.join(systems)}) — e.g. '{systems[0]}-<action>'."
+            )
+        # marketplace_name should describe the action, not the system (warn — heuristic)
+        if name:
+            nl = " " + re.sub(r"[^a-z0-9 ]", " ", name.lower()) + " "
+            sys_tokens = {
+                w for s in systems for w in s.split("-")
+                if len(w) >= 3 and w not in _GENERIC_SYSTEM_TOKENS
+            }
+            hit = next((w for w in sys_tokens if f" {w} " in nl), None)
+            if hit:
+                click.echo(
+                    f"Warning: marketplace_name '{name}' contains the system name "
+                    f"'{hit}'. Plugin titles should describe the action, not the system."
+                )
 
 
 def _normalize_and_validate_fields(
@@ -220,8 +291,12 @@ def _normalize_and_validate_fields(
                 f"Missing required field(s): {', '.join(sorted(missing))}."
             )
 
-    _validate_cross_field_rules(by_name, model_path)
+    _validate_cross_field_rules(by_name, model_path, is_create=require_all_required)
     return normalized
+
+
+# Fields that must never be changed once a fragment exists (identity fields).
+IMMUTABLE_ON_UPDATE = {"slug", "systems"}
 
 
 def _validate_slug_or_fail(slug: str, *, field_label: str = "slug"):
@@ -496,6 +571,64 @@ def _prompt_enum(label: str, options: list[dict], required: bool, multiple: bool
                    (" Separate multiple with commas." if multiple else ""))
 
 
+def _prompt_solution_tags(cfg: dict, field: dict) -> str | None:
+    """Prompt for solution_tags: pick from AEM-sourced suggestions and/or type new
+    Title Case tags. Returns a comma-joined string (or None if skipped)."""
+    name     = field.get("name", "")
+    label    = field.get("label") or name
+    required = field.get("required", False)
+    regex    = field.get("customValidationRegex", "")
+    max_len  = field.get("maxLength")
+    err_msg  = field.get("customErrorMessage", "Invalid tag.")
+
+    suggestions = t.get_solution_tag_suggestions(cfg)
+
+    req_tag = " (required)" if required else " (optional, Enter to skip)"
+    click.echo(f"\n  Field : {label}  [tags, Title Case]{req_tag}")
+    if suggestions:
+        click.echo("  Common tags (from AEM). Enter numbers and/or type new Title Case tags, comma-separated:")
+        for i, s in enumerate(suggestions, 1):
+            click.echo(f"    {i:>2}. {s}")
+    else:
+        click.echo("  Enter one or more Title Case tags, comma-separated (e.g. IT, Retail Store Services).")
+
+    while True:
+        raw = click.prompt("  Tags", default="", show_default=False).strip()
+        if not raw:
+            if required:
+                click.echo("  This field is required.")
+                continue
+            return None
+
+        chosen: list[str] = []
+        for tok in raw.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            if tok.isdigit() and suggestions and 1 <= int(tok) <= len(suggestions):
+                chosen.append(suggestions[int(tok) - 1])
+            else:
+                chosen.append(tok)
+
+        # de-dup, preserve order
+        seen: set[str] = set()
+        tags = [c for c in chosen if not (c in seen or seen.add(c))]
+
+        bad = None
+        for tag in tags:
+            if regex and not re.match(regex, tag):
+                bad = f"  '{tag}': {err_msg}"
+            elif max_len and len(tag) > int(max_len):
+                bad = f"  '{tag}' exceeds max length {max_len}."
+            if bad:
+                break
+        if bad:
+            click.echo(bad)
+            continue
+
+        return ",".join(tags)
+
+
 def _prompt_field_value(field: dict) -> str | None:
     """Prompt the user for a single model field value. Returns None if skipped."""
     name     = field.get("name", "")
@@ -631,18 +764,17 @@ def _interactive_create(cfg) -> dict:
     model_label = (chosen_model.get("title") or "").strip() or model_path.rstrip("/").rsplit("/", 1)[-1]
     click.echo(f"Model: {model_label}")
 
-    # ── resolve schema: use pre-fetched first, fall back to API ──────────────
-    schema_fields: list = environments.MODEL_SCHEMAS.get(model_path, [])
+    # ── resolve schema live from AEM (single source of truth) ────────────────
+    schema_fields: list = []
     title_required = True
 
-    if schema_fields:
-        click.echo(f"  Schema loaded ({len(schema_fields)} fields, pre-fetched).")
-    elif model_id:
+    if model_id:
         try:
             model_schema = t.get_model(cfg, id=model_id)
             schema_fields = model_schema.get("fields", [])
             title_required = model_schema.get("titleRequired", True)
-            click.echo(f"  Schema loaded ({len(schema_fields)} fields, from API).")
+            _SCHEMA_CACHE[model_path] = schema_fields
+            click.echo(f"  Schema loaded ({len(schema_fields)} fields, live from AEM).")
         except SystemExit:
             click.echo("  (Could not load schema — proceeding without field validation.)")
 
@@ -654,8 +786,9 @@ def _interactive_create(cfg) -> dict:
         default=default_parent if default_parent else None,
         prompt_suffix=" [default shown, Enter to accept]: " if default_parent else ": ",
     )
+    # The fragment name IS the slug — asked once, reused for both.
     while True:
-        name = click.prompt("Fragment name (slug, kebab-case)").strip()
+        name = click.prompt("Fragment name / slug (kebab-case)").strip()
         try:
             _validate_slug_or_fail(name, field_label="Fragment name")
             break
@@ -675,9 +808,17 @@ def _interactive_create(cfg) -> dict:
     # ── field prompts ─────────────────────────────────────────────────────────
     fields_list: list = []
     if schema_fields:
-        click.echo(f"\nEnter values for {len(schema_fields)} field(s):")
-        for field in schema_fields:
-            value = _prompt_field_value(field)
+        # `slug` mirrors the fragment name — don't prompt for it again.
+        promptable = [f for f in schema_fields if f.get("name") != "slug"]
+        if any(f.get("name") == "slug" for f in schema_fields):
+            fields_list.append({"name": "slug", "type": "text", "values": [name]})
+            click.echo(f"\n  slug = {name}  (from fragment name)")
+        click.echo(f"\nEnter values for {len(promptable)} field(s):")
+        for field in promptable:
+            if field.get("name") == "solution_tags":
+                value = _prompt_solution_tags(cfg, field)
+            else:
+                value = _prompt_field_value(field)
             if value is None:
                 continue
             ftype    = field.get("fieldType") or field.get("type", "text")
@@ -850,6 +991,10 @@ def update_fragment(id, title, field_args, patch, as_json):
         )
         for entry in normalized_fields:
             name = entry["name"]
+            if name in IMMUTABLE_ON_UPDATE:
+                raise click.ClickException(
+                    f"Field '{name}' cannot be changed after creation."
+                )
             if name in field_index:
                 idx = field_index[name]
                 patch_ops.append({"op": "replace", "path": f"/fields/{idx}/values", "value": entry["values"]})
@@ -886,6 +1031,10 @@ def update_fragment(id, title, field_args, patch, as_json):
                     [value],
                     require_all_required=False,
                 )[0]
+                if normalized["name"] in IMMUTABLE_ON_UPDATE:
+                    raise click.ClickException(
+                        f"Field '{normalized['name']}' cannot be changed after creation."
+                    )
                 op = {**op, "value": normalized}
                 effective_values[normalized["name"]] = normalized["values"]
 
@@ -896,6 +1045,10 @@ def update_fragment(id, title, field_args, patch, as_json):
                 field_name = fragment_fields[idx].get("name", "")
                 if field_name not in schema:
                     raise click.ClickException(f"Unknown model field in patch index {idx}: '{field_name}'.")
+                if field_name in IMMUTABLE_ON_UPDATE:
+                    raise click.ClickException(
+                        f"Field '{field_name}' cannot be changed after creation."
+                    )
                 raw_values = op.get("value")
                 if isinstance(raw_values, list):
                     values_input = [str(v) for v in raw_values]
@@ -924,6 +1077,10 @@ def update_fragment(id, title, field_args, patch, as_json):
                     [value],
                     require_all_required=False,
                 )[0]
+                if normalized["name"] in IMMUTABLE_ON_UPDATE:
+                    raise click.ClickException(
+                        f"Field '{normalized['name']}' cannot be changed after creation."
+                    )
                 op = {**op, "value": normalized}
                 effective_values[normalized["name"]] = normalized["values"]
 
@@ -937,7 +1094,7 @@ def update_fragment(id, title, field_args, patch, as_json):
 
             patch_ops.append(op)
 
-    _validate_cross_field_rules(effective_values, model_path)
+    _validate_cross_field_rules(effective_values, model_path, is_create=False)
 
     if not patch_ops:
         raise click.UsageError("Provide at least one of: --title, -f name=value, or --patch.")
