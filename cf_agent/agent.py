@@ -767,7 +767,7 @@ def _prompt_enum(label: str, options: list[dict], required: bool, multiple: bool
                  (" Separate multiple with commas." if multiple else ""))
 
 
-<<<<<<< HEAD
+
 def _prompt_solution_tags(cfg: dict, field: dict) -> str | None:
     """Prompt for solution_tags: pick from AEM-sourced suggestions and/or type new
     Title Case tags. Returns a comma-joined string (or None if skipped)."""
@@ -826,10 +826,8 @@ def _prompt_solution_tags(cfg: dict, field: dict) -> str | None:
         return ",".join(tags)
 
 
-def _prompt_field_value(field: dict) -> str | None:
-=======
 def _prompt_field_value(cfg: dict, field: dict) -> str | None:
->>>>>>> origin/master
+
     """Prompt the user for a single model field value. Returns None if skipped."""
     name     = field.get("name", "")
     label    = field.get("label") or name
@@ -980,23 +978,15 @@ def _interactive_create(cfg) -> dict:
     schema_fields: list = []
     title_required = True
 
-<<<<<<< HEAD
-    if model_id:
-=======
     if schema_fields:
         _hint(f"  Schema loaded ({len(schema_fields)} fields, pre-fetched).")
     elif model_id:
->>>>>>> origin/master
         try:
             model_schema = t.get_model(cfg, id=model_id)
             schema_fields = model_schema.get("fields", [])
             title_required = model_schema.get("titleRequired", True)
-<<<<<<< HEAD
             _SCHEMA_CACHE[model_path] = schema_fields
-            click.echo(f"  Schema loaded ({len(schema_fields)} fields, live from AEM).")
-=======
-            _hint(f"  Schema loaded ({len(schema_fields)} fields, from API).")
->>>>>>> origin/master
+            _hint(f"  Schema loaded ({len(schema_fields)} fields, live from AEM).")
         except SystemExit:
             _hint("  (Could not load schema — proceeding without field validation.)")
 
@@ -1010,11 +1000,7 @@ def _interactive_create(cfg) -> dict:
     )
     # The fragment name IS the slug — asked once, reused for both.
     while True:
-<<<<<<< HEAD
-        name = click.prompt("Fragment name / slug (kebab-case)").strip()
-=======
         name = click.prompt(click.style("Fragment name (slug, kebab-case)", fg="cyan")).strip()
->>>>>>> origin/master
         try:
             _validate_slug_or_fail(name, field_label="Fragment name")
             break
@@ -1033,23 +1019,18 @@ def _interactive_create(cfg) -> dict:
     # ── field prompts ─────────────────────────────────────────────────────────
     fields_list: list = []
     if schema_fields:
-<<<<<<< HEAD
         # `slug` mirrors the fragment name — don't prompt for it again.
         promptable = [f for f in schema_fields if f.get("name") != "slug"]
         if any(f.get("name") == "slug" for f in schema_fields):
             fields_list.append({"name": "slug", "type": "text", "values": [name]})
             click.echo(f"\n  slug = {name}  (from fragment name)")
-        click.echo(f"\nEnter values for {len(promptable)} field(s):")
+        _header(f"\nEnter values for {len(promptable)} field(s):")
         for field in promptable:
             if field.get("name") == "solution_tags":
                 value = _prompt_solution_tags(cfg, field)
             else:
-                value = _prompt_field_value(field)
-=======
-        _header(f"\nEnter values for {len(schema_fields)} field(s):")
-        for field in schema_fields:
-            value = _prompt_field_value(cfg, field)
->>>>>>> origin/master
+                value = _prompt_field_value(cfg, field)
+
             if value is None:
                 continue
             ftype    = field.get("fieldType") or field.get("type", "text")
