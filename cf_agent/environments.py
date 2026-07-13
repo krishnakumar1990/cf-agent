@@ -19,30 +19,31 @@ MODEL_DEFAULTS = {
 # ── Environment list ───────────────────────────────────────────────────────────
 
 ENVIRONMENTS = [
-    {"label": "PROD",     "url": "https://author-p193006-e2010455.adobeaemcloud.com/adobe/sites"},
-    {"label": "STAGE",    "url": "https://author-p193006-e2010299.adobeaemcloud.com/adobe/sites"},
-    {"label": "DEV",      "url": "https://author-p193006-e2010379.adobeaemcloud.com/adobe/sites"},
-    {"label": "MW-PROD",  "url": "https://author-p180958-e1901212.adobeaemcloud.com/adobe/sites"},
-    {"label": "MW-STAGE", "url": "https://author-p180958-e1901213.adobeaemcloud.com/adobe/sites"},
-    {"label": "MW-DEV",   "url": "https://author-p180958-e1901357.adobeaemcloud.com/adobe/sites"},
+    {"label": "NOW-Moveworks PROD",     "url": "https://author-p193006-e2010455.adobeaemcloud.com/adobe/sites"},
+    {"label": "NOW-Moveworks STAGE",    "url": "https://author-p193006-e2010299.adobeaemcloud.com/adobe/sites"},
+    {"label": "NOW-Moveworks DEV",      "url": "https://author-p193006-e2010379.adobeaemcloud.com/adobe/sites"},
 ]
 
 
 def prompt_environment_selection(current_url: str = "") -> str:
     """Numbered selector over ENVIRONMENTS. Returns the chosen URL."""
-    click.echo("\nAvailable AEM environments:")
+    click.secho("\nAvailable AEM environments:", fg="cyan", bold=True)
     for i, env in enumerate(ENVIRONMENTS, 1):
-        marker = " (current)" if env["url"] == current_url else ""
-        click.echo(f"  {i}. {env['label']:<8}  {env['url']}{marker}")
+        marker = click.style("  (current)", fg="green") if env["url"] == current_url else ""
+        click.echo(
+            "  " + click.style(f"{i}.", fg="cyan")
+            + " " + click.style(f"{env['label']:<8}", bold=True)
+            + click.style(f"  {env['url']}", fg="bright_black") + marker
+        )
 
     while True:
-        raw = click.prompt(f"\nSelect environment [1-{len(ENVIRONMENTS)}]", default="1")
+        raw = click.prompt(click.style(f"\nSelect environment [1-{len(ENVIRONMENTS)}]", fg="cyan"), default="1")
         try:
             idx = int(raw)
             if 1 <= idx <= len(ENVIRONMENTS):
                 chosen = ENVIRONMENTS[idx - 1]
-                click.echo(f"Selected: {chosen['label']}  ({chosen['url']})")
+                click.secho(f"Selected: {chosen['label']}  ({chosen['url']})", fg="green", bold=True)
                 return chosen["url"]
         except ValueError:
             pass
-        click.echo(f"Please enter a number between 1 and {len(ENVIRONMENTS)}.")
+        click.secho(f"Please enter a number between 1 and {len(ENVIRONMENTS)}.", fg="red")

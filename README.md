@@ -6,8 +6,34 @@ Supports interactive guided mode and one-liner commands for creating, reading, u
 
 ---
 
+## Quick Start
+
+Copy-paste this single block to create an isolated environment, install `cf-agent`, and log in to AEM. Requires **Python 3.10+**.
+
+```bash
+# 1. Create & activate a virtual environment
+python3 -m venv ~/.venvs/cf-agent
+source ~/.venvs/cf-agent/bin/activate
+
+# 2. Install cf-agent
+pip install "git+https://github.com/krishnakumar1990/cf-agent.git"
+
+# 3. Log in to AEM (opens your browser)
+cf-agent login
+```
+
+During login you'll be prompted for your **Adobe Client ID** and **Client Secret**; a browser then opens for Adobe IMS login, and finally you select an environment (PROD / STAGE / DEV). That's it — you're ready to run commands like `cf-agent fragments create -i`.
+
+> New terminal later? Just re-activate the environment first: `source ~/.venvs/cf-agent/bin/activate`
+> To have it activate automatically in every shell: `echo 'source ~/.venvs/cf-agent/bin/activate' >> ~/.zshrc`
+
+See [Installation](#installation) and [Authentication](#authentication) below for more detail and options.
+
+---
+
 ## Table of Contents
 
+- [Quick Start](#quick-start)
 - [Installation](#installation)
 - [Authentication](#authentication)
 - [Environment Management](#environment-management)
@@ -22,6 +48,7 @@ Supports interactive guided mode and one-liner commands for creating, reading, u
   - [copy](#copy)
   - [variations](#variations)
 - [Models](#models)
+- [Assets](#assets)
 - [Diagnostics](#diagnostics)
 - [Upgrading](#upgrading)
 
@@ -31,11 +58,26 @@ Supports interactive guided mode and one-liner commands for creating, reading, u
 
 Requires Python 3.10 or later.
 
+### Recommended: install into a virtual environment
+
+Using a virtual environment keeps `cf-agent` isolated from your system Python and avoids dependency conflicts.
+
 ```bash
+# Create and activate a virtual environment
+python3 -m venv ~/.venvs/cf-agent
+source ~/.venvs/cf-agent/bin/activate
+
+# Install cf-agent
 pip install "git+https://github.com/krishnakumar1990/cf-agent.git"
 ```
 
-Verify the installation:
+Add the activation line to your shell profile (e.g. `~/.zshrc` or `~/.bashrc`) so the environment is active in every new terminal:
+
+```bash
+echo 'source ~/.venvs/cf-agent/bin/activate' >> ~/.zshrc
+```
+
+### Verify the installation
 
 ```bash
 cf-agent --help
@@ -67,7 +109,7 @@ The browser will open for Adobe IMS login. After completing the login, you will 
 cf-agent login
 ```
 
-You will be prompted for all values including Adobe scopes and redirect URI.
+You will be prompted only for your **Adobe Client ID** and **Adobe Client Secret**. Scopes and the redirect URI use built-in defaults (no prompt), then the browser opens for login and you select an environment. This is the simplest path and needs no `shared.env` file — it's the same command used in the [Quick Start](#quick-start).
 
 ### Logout
 
@@ -109,12 +151,9 @@ cf-agent env list
 
 Example output:
 ```
-  1. PROD      https://author-p<PROGRAM_ID>-e<ENV_ID_PROD>.adobeaemcloud.com/adobe/sites
-  2. STAGE     https://author-p<PROGRAM_ID>-e<ENV_ID_STAGE>.adobeaemcloud.com/adobe/sites (current)
-  3. DEV       https://author-p<PROGRAM_ID>-e<ENV_ID_DEV>.adobeaemcloud.com/adobe/sites
-  4. MW-PROD   https://author-p<MW_PROGRAM_ID>-e<ENV_ID_MW_PROD>.adobeaemcloud.com/adobe/sites
-  5. MW-STAGE  https://author-p<MW_PROGRAM_ID>-e<ENV_ID_MW_STAGE>.adobeaemcloud.com/adobe/sites
-  6. MW-DEV    https://author-p<MW_PROGRAM_ID>-e<ENV_ID_MW_DEV>.adobeaemcloud.com/adobe/sites
+  1. NOW Moveworks PROD      https://author-p<PROGRAM_ID>-e<ENV_ID_PROD>.adobeaemcloud.com/adobe/sites
+  2. NOW Moveworks STAGE     https://author-p<PROGRAM_ID>-e<ENV_ID_STAGE>.adobeaemcloud.com/adobe/sites (current)
+  3. NOW Moveworks DEV       https://author-p<PROGRAM_ID>-e<ENV_ID_DEV>.adobeaemcloud.com/adobe/sites
 ```
 
 ### Switch environment interactively
@@ -298,8 +337,22 @@ cf-agent fragments create \
 | `agent_capabilities` | Plugin | enumeration (multi) | e.g. `Ambient Agent` |
 | `content_guide` | Both | long-text | File path to a `.md` file, e.g. `~/Desktop/guide.md` |
 | `video` | Both | text | YouTube, Vimeo, or Loom URL |
-| `installation_uuid` | Both | text | Connector: 32 hex chars · Plugin: full UUID format |
+| `installation_uuid` | Both | text | Connector: 32 hex chars · Plugin: full UUID format — **required** when `availability=INSTALLABLE` |
 | `reviewRequired` | Both | enumeration | `true` to send for review and lock |
+
+#### Validation
+
+Before writing to AEM, `cf-agent` validates every field against the live model schema:
+
+- **Required fields** — an error is raised if any required field is missing.
+- **Enumeration values** — invalid options are rejected with the list of allowed values.
+- **Max length** — text fields that exceed their configured limit are caught early.
+- **Regex** — fields with a custom validation pattern are checked client-side.
+- **Content references** (`logo`) — the DAM asset path is verified to exist in AEM before the fragment is created. In interactive mode the logo is checked as soon as you enter it, so a typo can be fixed on the spot. See [`asset exists`](#assets) to check any asset manually.
+- **Content guide asset references** — when a `content_guide` markdown file is supplied, every AEM asset it references (`/content/dam/...` image links, markdown links, and `<img>` tags, including full AEM URLs) is verified to exist in the DAM. Creation is blocked, with the missing paths listed, if any reference is broken.
+- **Slug format** — the fragment name must be lowercase kebab-case (e.g. `my-connector`).
+- **Duplicate slugs** — AEM is searched for an existing fragment with the same slug before writing. If one is found, the command exits with an error and the conflicting path.
+- **Cross-field rules** — `installation_uuid` is required when `availability` is `INSTALLABLE`.
 
 **Multi-value fields** — comma-separate values in a single `-f` flag:
 ```bash
@@ -462,6 +515,70 @@ cf-agent models list --path /conf/marketplace/settings/dam/cfm/models
 
 ---
 
+## Assets
+
+Check whether a logo or image exists in the AEM DAM. This uses the AEM Assets Author API (asset search) — the same verification applied automatically to the `logo` field and to any `/content/dam/...` references inside a content guide during [`fragments create`](#create).
+
+### exists
+
+```bash
+cf-agent asset exists <ASSET_REF> [--logo | --image | --root <DAM_PATH>] [--json]
+```
+
+`ASSET_REF` may be a **full DAM path**, or a **bare file name** when one of the folder flags is supplied:
+
+| Flag | Resolves a bare name against |
+| --- | --- |
+| `--logo` | `/content/dam/marketplace/logos` |
+| `--image` | `/content/dam/marketplace/images` |
+| `--root <DAM_PATH>` | the folder you specify (e.g. `/content/dam/marketplace/screenshots`) |
+
+Only one of `--logo`, `--image`, or `--root` may be used at a time. A bare name with none of them is rejected.
+
+**Examples:**
+
+```bash
+# Bare file name resolved against the logos folder
+cf-agent asset exists smartsheet.png --logo
+
+# Bare file name resolved against the images folder
+cf-agent asset exists banner.png --image
+
+# Full DAM path (no flag needed)
+cf-agent asset exists /content/dam/marketplace/logos/smartsheet.png
+
+# Any other folder
+cf-agent asset exists diagram.png --root /content/dam/marketplace/screenshots
+
+# Machine-readable output
+cf-agent asset exists smartsheet.png --logo --json
+```
+
+**Example output:**
+
+```
+✓ Asset exists: /content/dam/marketplace/logos/smartsheet.png
+```
+
+```json
+{
+  "path": "/content/dam/marketplace/logos/smartsheet.png",
+  "exists": true
+}
+```
+
+**Exit codes:** `0` if the asset exists, `1` if it does not — so the command can be used directly in scripts:
+
+```bash
+if cf-agent asset exists smartsheet.png --logo; then
+  echo "Logo is present"
+fi
+```
+
+> **Note:** requires the access token to carry the `aem.assets.author` scope. Without it the Assets API returns 403 and the check fails loudly rather than silently passing.
+
+---
+
 ## Diagnostics
 
 ### whoami
@@ -478,8 +595,9 @@ Useful for debugging 403 errors — checks whether the token's IMS org matches t
 
 ## Upgrading
 
-Pull the latest version from GitHub:
+Pull the latest version from GitHub. If you installed into a virtual environment, activate it first:
 
 ```bash
+source ~/.venvs/cf-agent/bin/activate
 pip install --upgrade "git+https://github.com/krishnakumar1990/cf-agent.git"
 ```
