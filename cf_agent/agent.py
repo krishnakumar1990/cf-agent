@@ -229,6 +229,13 @@ def _validate_single_value(cfg: dict, field_def: dict, value: str) -> str:
     return value
 
 
+# Enum fields where the CLI also accepts NEW free-text values, even though the AEM
+# authoring UI is pick-only. The model enum supplies the suggestion list; new values
+# must be Title Case (matching the curated list's casing).
+FREE_TEXT_ENUM_FIELDS = {"solution_tags"}
+_TITLE_CASE_TAG = re.compile(r"^[A-Z0-9][A-Za-z0-9]*([ &/-]+[A-Z0-9][A-Za-z0-9]*)*$")
+
+
 def _validate_field_values(cfg: dict, field_def: dict, values: list[str]) -> list[str]:
     """Validate one field's values and return normalized values."""
     name = field_def.get("name", "")
@@ -247,13 +254,22 @@ def _validate_field_values(cfg: dict, field_def: dict, values: list[str]) -> lis
         normalized = [first] if first else []
 
     if ftype == "enumeration" and normalized:
-        allowed = _enum_allowed_values(field_def)
-        invalid = [v for v in normalized if v not in allowed]
-        if invalid:
-            invalid_list = ", ".join(invalid)
-            raise click.ClickException(
-                f"Field '{name}' has invalid option(s): {invalid_list}."
-            )
+        if name in FREE_TEXT_ENUM_FIELDS:
+            # Allow values outside the list, but enforce the curated Title Case format.
+            bad = [v for v in normalized if not _TITLE_CASE_TAG.match(v)]
+            if bad:
+                raise click.ClickException(
+                    f"Field '{name}': new tags must be Title Case "
+                    f"(e.g. 'Retail Store Services'). Invalid: {', '.join(bad)}."
+                )
+        else:
+            allowed = _enum_allowed_values(field_def)
+            invalid = [v for v in normalized if v not in allowed]
+            if invalid:
+                invalid_list = ", ".join(invalid)
+                raise click.ClickException(
+                    f"Field '{name}' has invalid option(s): {invalid_list}."
+                )
 
     return [_validate_single_value(cfg, field_def, v) for v in normalized]
 
@@ -769,28 +785,24 @@ def _prompt_enum(label: str, options: list[dict], required: bool, multiple: bool
 
 
 def _prompt_solution_tags(cfg: dict, field: dict) -> str | None:
-    """Prompt for solution_tags: pick from AEM-sourced suggestions and/or type new
-    Title Case tags. Returns a comma-joined string (or None if skipped)."""
-    name     = field.get("name", "")
-    label    = field.get("label") or name
+    """solution_tags: pick from the model's enum values and/or type a new Title Case
+    tag. Suggestions come from the CF model enum (read via the models API — no
+    GraphQL). Returns a comma-joined string (or None if skipped)."""
+    label    = field.get("label") or field.get("name", "")
     required = field.get("required", False)
-    regex    = field.get("customValidationRegex", "")
-    max_len  = field.get("maxLength")
-    err_msg  = field.get("customErrorMessage", "Invalid tag.")
-
-    suggestions = t.get_solution_tag_suggestions(cfg)
+    options  = _parse_enum_options(field.get("values") or field.get("enumValues") or [])
 
     req_tag = " (required)" if required else " (optional, Enter to skip)"
-    click.echo(f"\n  Field : {label}  [tags, Title Case]{req_tag}")
-    if suggestions:
-        click.echo("  Common tags (from AEM). Enter numbers and/or type new Title Case tags, comma-separated:")
-        for i, s in enumerate(suggestions, 1):
-            click.echo(f"    {i:>2}. {s}")
+    click.echo(f"\n  Field : {label}  [pick from list or type new]{req_tag}")
+    if options:
+        click.echo("  Enter numbers and/or type new Title Case tags, comma-separated:")
+        for i, o in enumerate(options, 1):
+            click.echo(f"    {i:>2}. {o['label']}")
     else:
         click.echo("  Enter one or more Title Case tags, comma-separated (e.g. IT, Retail Store Services).")
 
     while True:
-        raw = click.prompt("  Tags", default="", show_default=False).strip()
+        raw = click.prompt("  Value", default="", show_default=False).strip()
         if not raw:
             if required:
                 click.echo("  This field is required.")
@@ -802,27 +814,17 @@ def _prompt_solution_tags(cfg: dict, field: dict) -> str | None:
             tok = tok.strip()
             if not tok:
                 continue
-            if tok.isdigit() and suggestions and 1 <= int(tok) <= len(suggestions):
-                chosen.append(suggestions[int(tok) - 1])
+            if tok.isdigit() and 1 <= int(tok) <= len(options):
+                chosen.append(options[int(tok) - 1]["value"])
             else:
-                chosen.append(tok)
+                chosen.append(tok)  # new free-text value
 
-        # de-dup, preserve order
         seen: set[str] = set()
         tags = [c for c in chosen if not (c in seen or seen.add(c))]
-
-        bad = None
-        for tag in tags:
-            if regex and not re.match(regex, tag):
-                bad = f"  '{tag}': {err_msg}"
-            elif max_len and len(tag) > int(max_len):
-                bad = f"  '{tag}' exceeds max length {max_len}."
-            if bad:
-                break
+        bad = [c for c in tags if not _TITLE_CASE_TAG.match(c)]
         if bad:
-            click.echo(bad)
+            click.echo(f"  New tags must be Title Case (e.g. 'Retail Store Services'). Invalid: {', '.join(bad)}")
             continue
-
         return ",".join(tags)
 
 

@@ -92,31 +92,6 @@ def get_model(cfg, *, id):
     return r.json()
 
 
-def get_solution_tag_suggestions(cfg):
-    """Distinct plugin solution_tags from AEM, most-used first.
-
-    Sourced from the marketplace's own persisted GraphQL query so the suggestion
-    list stays in AEM (no hardcoded copy). Best-effort UX: returns [] if the query
-    is unavailable on the environment, so it never blocks fragment creation.
-    """
-    try:
-        r = client.author_request(
-            cfg, "GET", "/graphql/execute.json/marketplace/MarketplaceResources"
-        )
-        if r.is_error:
-            return []
-        items = (r.json().get("data", {}).get("pluginList") or {}).get("items", [])
-    except Exception:
-        return []
-
-    counts: dict[str, int] = {}
-    for item in items:
-        for tag in (item.get("solution_tags") or []):
-            if tag:
-                counts[tag] = counts.get(tag, 0) + 1
-    return [t for t, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
-
-
 def list_variations(cfg, *, fragment_id):
     r = client.request(cfg, "GET", f"/cf/fragments/{fragment_id}/variations")
     return r.json()
