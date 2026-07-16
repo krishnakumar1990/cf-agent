@@ -1,7 +1,12 @@
 """CLI entry point for cf-agent."""
 
+import contextlib
+import itertools
 import json
 import re
+import sys
+import threading
+import time
 from pathlib import Path
 
 import click
@@ -46,6 +51,41 @@ def _failure(msg: str) -> None:
 def _hint(msg: str) -> None:
     """Secondary guidance / hint — dim grey."""
     click.secho(msg, fg="bright_black")
+
+
+@contextlib.contextmanager
+def _spinner(message: str):
+    """Animated spinner shown on stderr while a slow (usually network) block runs.
+
+    On a non-TTY (piped output, CI, tests) it degrades to printing the message
+    once with no animation, so logs stay clean. The spinner line is cleared on
+    exit whether the block returns or raises, so any error/prompt that follows
+    starts on a fresh line.
+    """
+    stream = sys.stderr
+    if not stream.isatty():
+        click.echo(message, err=True)
+        yield
+        return
+
+    done = threading.Event()
+    frames = itertools.cycle("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+
+    def _spin():
+        while not done.is_set():
+            stream.write("\r" + click.style(next(frames), fg="cyan") + " " + message)
+            stream.flush()
+            time.sleep(0.08)
+
+    worker = threading.Thread(target=_spin, daemon=True)
+    worker.start()
+    try:
+        yield
+    finally:
+        done.set()
+        worker.join()
+        stream.write("\r" + " " * (len(message) + 4) + "\r")
+        stream.flush()
 
 
 def _field_heading(label: str, ftype: str, required: bool) -> None:
@@ -410,6 +450,10 @@ def _validate_slug_or_fail(slug: str, *, field_label: str = "slug"):
         )
 
 
+def _folder_for_model(model_path: str, search_folder: str = "") -> str:
+    return search_folder.rstrip("/") or environments.MODEL_DEFAULTS.get(model_path, "")
+
+
 def _check_duplicate_slug(
     cfg: dict,
     slug: str,
@@ -418,42 +462,104 @@ def _check_duplicate_slug(
     *,
     exclude_fragment_id: str = "",
 ) -> None:
-    """Raise ClickException if another fragment in AEM already carries this slug value."""
-    folder = search_folder.rstrip("/") or environments.MODEL_DEFAULTS.get(model_path, "")
+    """Raise ClickException if a fragment already exists at this slug in the model's folder.
+
+    Single targeted call, no folder scan: GET /cf/fragments?path=<folder>/<slug>. Given a
+    full asset path, the CF list endpoint returns just that fragment (items=[…]) or nothing
+    (items=[]). The fragment's JCR node name equals its slug in this system, so an exact
+    path match is an exact slug match. A listing failure fails open — AEM still rejects a
+    duplicate node name at create time as the final backstop.
+    """
+    folder = _folder_for_model(model_path, search_folder)
+    if not folder:
+        return
+
+    frag_path = f"{folder}/{slug}"
     try:
-        results = t.search_fragments(cfg, query=slug, path=folder or None, limit=50)
+        results = t.list_fragments(cfg, path=frag_path, limit=5)
     except (Exception, SystemExit):
-        return  # any search failure must not block the create/update
+        return
 
     for fragment in results.get("items", []):
         if exclude_fragment_id and fragment.get("id") == exclude_fragment_id:
             continue
-
-        frag_path = fragment.get("path", "")
-
-        # Prefer exact slug-field check when the search response includes field data.
-        frag_fields = fragment.get("fields", [])
-        if frag_fields:
-            slug_field = next((f for f in frag_fields if f.get("name") == "slug"), None)
-            if slug_field and slug in (slug_field.get("values") or []):
-                raise click.ClickException(
-                    f"Slug '{slug}' is already in use by an existing fragment: {frag_path}\n"
-                    "Choose a unique slug."
-                )
-        else:
-            # Fall back: the JCR node name (last path segment) equals the slug in practice.
-            if frag_path.rstrip("/").endswith(f"/{slug}"):
-                raise click.ClickException(
-                    f"Slug '{slug}' is already in use by an existing fragment: {frag_path}\n"
-                    "Choose a unique slug."
-                )
+        if fragment.get("path", "").rstrip("/") == frag_path:
+            raise click.ClickException(
+                f"Slug '{slug}' is already in use by an existing fragment: {frag_path}\n"
+                "Choose a unique slug."
+            )
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
+_ANSI_RE = re.compile("\x1b\\[[0-9;]*m")  # CSI SGR (color) sequences
+
+
+def _enable_prompt_history() -> None:
+    """Give interactive prompts line editing + up/down arrow history recall.
+
+    click.prompt calls input(), which automatically uses the readline module for
+    line editing and history the moment readline is imported. We also load/save a
+    small history file so arrow-up recalls values typed in previous runs. Hidden
+    prompts (e.g. the client secret at login) use getpass, which bypasses readline,
+    so secrets are never added to history. Best-effort — silently skipped where
+    readline is unavailable (e.g. bare Windows without pyreadline3).
+
+    On macOS the stdlib `readline` is backed by BSD libedit, whose default bindings
+    mishandle up/down history (the current line isn't replaced cleanly). We prefer
+    the `gnureadline` drop-in (real GNU readline); if only libedit is present, we
+    bind the arrow keys explicitly so history navigation replaces the line.
+    """
+    try:
+        import gnureadline as readline
+        # Make gnureadline THE readline for this process, so the input() hook can't be
+        # reverted to libedit if some later code does `import readline`.
+        sys.modules["readline"] = readline
+    except ImportError:
+        try:
+            import readline
+        except ImportError:
+            return
+        if "libedit" in (readline.__doc__ or ""):
+            readline.parse_and_bind("bind ^[[A ed-prev-history")
+            readline.parse_and_bind("bind ^[[B ed-next-history")
+
+    # Colored prompts (click.style) embed ANSI escape codes. readline counts those
+    # invisible bytes as visible width unless they're wrapped in \001..\002, which
+    # throws off cursor math — up/down history recall then erases from the wrong
+    # column and leaves stale characters on the line. Wrap the visible-prompt hook
+    # once so every click.prompt gets readline-safe, zero-width-marked color codes.
+    if not getattr(click.termui, "_cf_rlsafe_wrapped", False):
+        _orig_vpf = click.termui.visible_prompt_func
+
+        def _rlsafe_prompt(prompt: str = "") -> str:
+            return _orig_vpf(_ANSI_RE.sub("\001\\g<0>\002", prompt))
+
+        click.termui.visible_prompt_func = _rlsafe_prompt
+        click.termui._cf_rlsafe_wrapped = True
+
+    try:
+        config.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        readline.read_history_file(str(config.HISTORY_FILE))
+    except OSError:
+        pass  # no history file yet, or unreadable — start fresh
+    readline.set_history_length(1000)
+
+    import atexit
+
+    def _save_history() -> None:
+        try:
+            readline.write_history_file(str(config.HISTORY_FILE))
+        except OSError:
+            pass
+
+    atexit.register(_save_history)
+
+
 @click.group()
 def cli():
     """cf-agent — CLI for AEM Content Fragments."""
+    _enable_prompt_history()
 
 
 # ── auth ──────────────────────────────────────────────────────────────────────
@@ -946,8 +1052,8 @@ def _prompt_field_value(cfg: dict, field: dict) -> str | None:
 def _interactive_create(cfg) -> dict:
     """Walk the user through creating a fragment step by step."""
     # ── pick model ────────────────────────────────────────────────────────────
-    _hint("\nFetching available models...")
-    models_data = t.list_models(cfg, limit=50)
+    with _spinner("Fetching available models..."):
+        models_data = t.list_models(cfg, limit=50)
     model_items = models_data.get("items", [])
     if not model_items:
         raise click.ClickException("No models found on this environment.")
@@ -995,16 +1101,53 @@ def _interactive_create(cfg) -> dict:
     # ── basic fragment details ────────────────────────────────────────────────
     click.echo("")
     default_parent = environments.MODEL_DEFAULTS.get(model_path, "")
-    parent_path = click.prompt(
-        click.style("Parent folder path", fg="cyan"),
-        default=default_parent if default_parent else None,
-        prompt_suffix=" [default shown, Enter to accept]: " if default_parent else ": ",
-    )
-    # The fragment name IS the slug — asked once, reused for both.
+    if default_parent:
+        # Each model has a fixed home folder (environments.MODEL_DEFAULTS) — use it
+        # silently so the user has one less thing to see or answer.
+        parent_path = default_parent
+    else:
+        # No known default (unregistered model) — fall back to asking.
+        parent_path = click.prompt(
+            click.style("Parent folder path", fg="cyan"),
+            prompt_suffix=": ",
+        )
+
+    # ── systems first (plugin only) → derive the slug prefix ──────────────────
+    # A plugin slug must start with one of its systems (e.g. "tableau-export-view"),
+    # so we ask for `systems` up front and pre-seed the name prompt with "<system>-".
+    # The user then only types the action part. Connectors have no `systems`, so this
+    # is skipped and the name prompt is plain.
+    schema = _schema_map(schema_fields) if schema_fields else {}
+    systems_field = schema.get("systems")
+    systems_values: list = []
+    slug_prefix = ""
+    if systems_field:
+        value = _prompt_field_value(cfg, systems_field)
+        systems_values = [v.strip() for v in (value or "").split(",") if v.strip()]
+        if systems_values:
+            slug_prefix = f"{systems_values[0]}-"
+
+    # The fragment name IS the slug — asked once, reused for both. For plugins the
+    # slug prefix is shown pre-filled; the user types the rest. We validate the full
+    # slug and check for a duplicate up front so it's caught here (re-prompt) rather
+    # than after every other field is filled in.
     while True:
-        name = click.prompt(click.style("Fragment name (slug, kebab-case)", fg="cyan")).strip()
+        typed = click.prompt(
+            click.style("Fragment name (slug, kebab-case)", fg="cyan"),
+            prompt_suffix=f": {slug_prefix}",
+            default="", show_default=False,
+        ).strip()
+        # Don't double the prefix if the user typed it (or the bare system) anyway.
+        if slug_prefix and (typed.startswith(slug_prefix) or typed in systems_values):
+            name = typed
+        else:
+            name = f"{slug_prefix}{typed}"
         try:
+            if not typed:
+                raise click.ClickException("Fragment name is required.")
             _validate_slug_or_fail(name, field_label="Fragment name")
+            with _spinner("Checking slug availability..."):
+                _check_duplicate_slug(cfg, name, model_path, parent_path)
             break
         except click.ClickException as exc:
             _failure(exc.format_message())
@@ -1021,14 +1164,28 @@ def _interactive_create(cfg) -> dict:
     # ── field prompts ─────────────────────────────────────────────────────────
     fields_list: list = []
     if schema_fields:
-        # `slug` mirrors the fragment name — don't prompt for it again.
-        promptable = [f for f in schema_fields if f.get("name") != "slug"]
+        # `slug` mirrors the fragment name and `systems` was already collected above —
+        # don't prompt for either again.
         if any(f.get("name") == "slug" for f in schema_fields):
             fields_list.append({"name": "slug", "type": "text", "values": [name]})
-            click.echo(f"\n  slug = {name}  (from fragment name)")
+        if systems_values:
+            sftype = systems_field.get("fieldType") or systems_field.get("type", "text")
+            fields_list.append({"name": "systems", "type": sftype, "values": systems_values})
+        promptable = [f for f in schema_fields if f.get("name") not in ("slug", "systems")]
         _header(f"\nEnter values for {len(promptable)} field(s):")
+        availability = ""  # captured when the availability field is prompted (comes first)
         for field in promptable:
-            if field.get("name") == "solution_tags":
+            fname = field.get("name")
+
+            # installation_uuid is only valid when availability is INSTALLABLE
+            # (forbidden for IDEA / VALIDATED / BUILT_IN). Only prompt for it in that
+            # case — and make it required then — instead of asking and failing later.
+            if fname == "installation_uuid":
+                if availability != "INSTALLABLE":
+                    continue
+                field = {**field, "required": True}
+
+            if fname == "solution_tags":
                 value = _prompt_solution_tags(cfg, field)
             else:
                 value = _prompt_field_value(cfg, field)
@@ -1039,7 +1196,9 @@ def _interactive_create(cfg) -> dict:
             multiple = field.get("multiple", False)
             # Multi-value fields come back as comma-separated string from _prompt_enum
             values_list = [v.strip() for v in value.split(",")] if multiple else [value]
-            entry = {"name": field["name"], "type": ftype, "values": values_list}
+            if fname == "availability":
+                availability = values_list[0] if values_list else ""
+            entry = {"name": fname, "type": ftype, "values": values_list}
             # Preserve mimeType for long-text fields
             if ftype == "long-text" and field.get("mimeType"):
                 entry["mimeType"] = field["mimeType"]
@@ -1153,17 +1312,19 @@ def create_fragment(interactive, parent_path, model_path, name, field_args, fiel
 
     params.pop("modelPath", None)
 
-    # Duplicate-slug guard: search AEM before writing.
+    # Duplicate-slug guard: scan the model's folder before writing.
     slug_entry = next((f for f in (params.get("fields") or []) if f.get("name") == "slug"), None)
     if slug_entry and slug_entry.get("values"):
-        _check_duplicate_slug(
-            cfg,
-            slug_entry["values"][0],
-            model_path,
-            params.get("parentPath", ""),
-        )
+        with _spinner("Checking slug availability..."):
+            _check_duplicate_slug(
+                cfg,
+                slug_entry["values"][0],
+                model_path,
+                params.get("parentPath", ""),
+            )
 
-    data = t.create_fragment(cfg, **params)
+    with _spinner("Creating fragment in AEM..."):
+        data = t.create_fragment(cfg, **params)
     if as_json:
         _print_json(data)
         return

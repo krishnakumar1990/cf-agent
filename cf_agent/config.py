@@ -15,6 +15,7 @@ from pathlib import Path
 CONFIG_DIR = Path.home() / ".cf-agent"
 CONFIG_FILE = CONFIG_DIR / "config"
 TOKEN_FILE = CONFIG_DIR / "tokens"
+HISTORY_FILE = CONFIG_DIR / "history"  # readline history for interactive prompts
 
 ADOBE_AUTHORIZE_URL = "https://ims-na1.adobelogin.com/ims/authorize/v2"
 ADOBE_TOKEN_URL = "https://ims-na1.adobelogin.com/ims/token/v3"

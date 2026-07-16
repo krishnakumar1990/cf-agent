@@ -1,5 +1,6 @@
 # Virtual environment
 .venv/
+venv/
 
 # Build artifacts
 dist/
@@ -14,3 +15,8 @@ __pycache__/
 # Credentials — never commit
 .env
 *.env.local
+
+# Local-only docs & test scripts (not part of the installable package)
+/VALIDATION_RUNBOOK.md
+/VALIDATION_FLOW.md
+/scripts/run_runbook.sh
