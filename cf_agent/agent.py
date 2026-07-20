@@ -119,15 +119,25 @@ def _looks_like_file_path(value: str) -> bool:
 
 
 def _read_markdown_value(value: str) -> str:
-    """Read long-text content from file when the value is a path-like input."""
+    """Read long-text content from a file when the value is a path; otherwise return the
+    value unchanged (inline markdown).
+
+    Path-likeness is checked FIRST so already-loaded, multi-line content is never probed
+    against the filesystem — calling Path(huge_string).exists() raises OSError('File name
+    too long'). The filesystem probe is also guarded so an over-long single-line value is
+    treated as inline content instead of crashing.
+    """
+    if not _looks_like_file_path(value):
+        return value
     candidate = Path(value.strip("'\"")).expanduser()
-    if candidate.exists() and candidate.is_file():
-        return candidate.read_text(encoding="utf-8")
-    if _looks_like_file_path(value):
-        raise click.ClickException(
-            f"Long-text value looks like a file path but file was not found/readable: {value}"
-        )
-    return value
+    try:
+        if candidate.exists() and candidate.is_file():
+            return candidate.read_text(encoding="utf-8")
+    except OSError:
+        return value  # not a usable path (e.g. too long) — treat as inline content
+    raise click.ClickException(
+        f"Long-text value looks like a file path but file was not found/readable: {value}"
+    )
 
 
 # NOTE: content_type ("connector"/"plugin") is a model-level constant — the model's
@@ -260,13 +270,25 @@ def _validate_single_value(cfg: dict, field_def: dict, value: str) -> str:
         raise click.ClickException(f"Field '{name}': {err_msg}")
 
     if ftype == "content-reference":
-        root = field_def.get("root", "/content/dam").rstrip("/")
+        root = _effective_content_root(field_def)
         if root != "/content/dam" and not value.startswith("/"):
             value = f"{root}/{value}"
         if not _asset_exists(cfg, value):
             raise click.ClickException(f"Referenced asset does not exist in AEM: {value}")
 
     return value
+
+
+# Fields removed from the marketplace models but possibly still present on a not-yet-
+# redeployed environment. The CLI treats them as gone: never prompted, and dropped if
+# supplied via -f (so no stale data is written). Once every environment is redeployed
+# without these fields this set can be emptied.
+DEPRECATED_FIELDS = {"redirects"}
+
+# The installation-UUID field was renamed installation_uuid -> installation_asset_uuid.
+# Until the model rename is deployed everywhere, the CLI treats both names as the same
+# logical field (existing data / un-redeployed envs use the old name).
+INSTALLATION_UUID_FIELDS = ("installation_asset_uuid", "installation_uuid")
 
 
 # Enum fields where the CLI also accepts NEW free-text values, even though the AEM
@@ -337,17 +359,24 @@ def _validate_cross_field_rules(
     wrongly block edits to legacy fragments.
     """
     availability = (field_values.get("availability") or [""])[0]
-    install_uuid = (field_values.get("installation_uuid") or [""])[0]
+    # Accept either field name so this works before AND after the installation_uuid ->
+    # installation_asset_uuid model rename is deployed (existing fragments store the old
+    # name; a redeployed model uses the new one).
+    install_uuid = ""
+    for _k in INSTALLATION_UUID_FIELDS:
+        if field_values.get(_k):
+            install_uuid = field_values[_k][0]
+            break
 
     if availability == "INSTALLABLE":
         if not install_uuid:
             raise click.ClickException(
-                "installation_uuid is required when availability is INSTALLABLE."
+                "installation_asset_uuid is required when availability is INSTALLABLE."
             )
     elif availability in ("VALIDATED", "IDEA", "BUILT_IN"):
         if install_uuid:
             raise click.ClickException(
-                f"installation_uuid must not be set when availability is {availability} "
+                f"installation_asset_uuid must not be set when availability is {availability} "
                 "(only INSTALLABLE assets may carry an installation UUID)."
             )
 
@@ -400,6 +429,8 @@ def _normalize_and_validate_fields(
         name = (field.get("name") or "").strip()
         if not name:
             raise click.ClickException("Field entries must include a non-empty 'name'.")
+        if name in DEPRECATED_FIELDS:
+            continue  # removed field — silently drop so nothing stale is sent
         if name not in schema:
             raise click.ClickException(f"Unknown field name '{name}' for model '{model_path}'.")
 
@@ -439,8 +470,30 @@ def _normalize_and_validate_fields(
     return normalized
 
 
-# Fields that must never be changed once a fragment exists (identity fields).
-IMMUTABLE_ON_UPDATE = {"slug", "systems"}
+# Fields that must never be changed once a fragment exists. `slug`/`systems` are
+# identity; `availability` is fixed at creation (a plugin's VALIDATED/INSTALLABLE state
+# doesn't change via guide updates).
+IMMUTABLE_ON_UPDATE = {"slug", "systems", "availability"}
+
+# Fields a user may edit on update, per the marketplace guide journeys (keyed by model
+# name). Anything not listed is locked on update — the interactive loop won't offer it
+# and -f/--patch on it is rejected. `installation_asset_uuid` applies once the model
+# rename is deployed (on an un-redeployed env the field is still `installation_uuid`).
+EDITABLE_ON_UPDATE = {
+    "marketplace-plugin": {
+        "marketplace_name", "description", "purple_chat_link",
+        "solution_tags", "content_guide",
+        *INSTALLATION_UUID_FIELDS,  # both names during the rename transition
+    },
+    "marketplace-connector": {"logo", "content_guide"},
+}
+
+
+def _editable_fields_for(model_path: str) -> set | None:
+    """Return the journey's editable field set for a model, or None if the model is
+    unknown (in which case no allow-list is enforced)."""
+    name = model_path.rstrip("/").rsplit("/", 1)[-1]
+    return EDITABLE_ON_UPDATE.get(name)
 
 
 def _validate_slug_or_fail(slug: str, *, field_label: str = "slug"):
@@ -662,6 +715,29 @@ def whoami():
 # DAM folders for marketplace assets (logos matches the connector model's logo field root).
 LOGO_ROOT = "/content/dam/marketplace/logos"
 IMAGE_ROOT = "/content/dam/marketplace/images"
+
+# Fallback DAM roots for content-reference fields, keyed by field name. Used when the
+# model's own root is the generic "/content/dam" (e.g. not yet set to a specific folder),
+# so users can type just a file name (logo -> /content/dam/marketplace/logos/<file>). The
+# model's root always wins when it points to a specific folder.
+_CONTENT_REF_ROOT_DEFAULTS = {
+    "logo": LOGO_ROOT,
+    "image": IMAGE_ROOT,
+    "images": IMAGE_ROOT,
+}
+
+
+def _effective_content_root(field: dict) -> str:
+    """Resolve the DAM folder to prepend for a content-reference field.
+
+    Prefer the model's root; if that's the generic "/content/dam", fall back to a
+    known per-field default so file-name-only entry works even before the model is
+    redeployed with a specific rootPath.
+    """
+    root = (field.get("root") or "/content/dam").rstrip("/")
+    if root == "/content/dam":
+        return _CONTENT_REF_ROOT_DEFAULTS.get(field.get("name", ""), root)
+    return root
 
 
 @cli.group()
@@ -999,7 +1075,7 @@ def _prompt_field_value(cfg: dict, field: dict) -> str | None:
     if ftype == "boolean":
         _hint("  Enter: true or false")
     elif ftype == "content-reference":
-        root = field.get("root", "/content/dam").rstrip("/")
+        root = _effective_content_root(field)
         if root != "/content/dam":
             _hint(f"  Path prefix: {root}/")
             _hint("  Enter the file name only (e.g. my-logo.svg)")
@@ -1037,7 +1113,7 @@ def _prompt_field_value(cfg: dict, field: dict) -> str | None:
 
         # Prepend root prefix for content-reference fields with a specific folder
         if ftype == "content-reference":
-            root = field.get("root", "/content/dam").rstrip("/")
+            root = _effective_content_root(field)
             if root != "/content/dam" and not value.startswith("/"):
                 value = f"{root}/{value}"
             # Verify the asset exists in AEM now, so a typo can be corrected in
@@ -1171,16 +1247,20 @@ def _interactive_create(cfg) -> dict:
         if systems_values:
             sftype = systems_field.get("fieldType") or systems_field.get("type", "text")
             fields_list.append({"name": "systems", "type": sftype, "values": systems_values})
-        promptable = [f for f in schema_fields if f.get("name") not in ("slug", "systems")]
+        promptable = [
+            f for f in schema_fields
+            if f.get("name") not in ("slug", "systems")
+            and f.get("name") not in DEPRECATED_FIELDS
+        ]
         _header(f"\nEnter values for {len(promptable)} field(s):")
         availability = ""  # captured when the availability field is prompted (comes first)
         for field in promptable:
             fname = field.get("name")
 
-            # installation_uuid is only valid when availability is INSTALLABLE
+            # installation_asset_uuid is only valid when availability is INSTALLABLE
             # (forbidden for IDEA / VALIDATED / BUILT_IN). Only prompt for it in that
             # case — and make it required then — instead of asking and failing later.
-            if fname == "installation_uuid":
+            if fname in INSTALLATION_UUID_FIELDS:
                 if availability != "INSTALLABLE":
                     continue
                 field = {**field, "required": True}
@@ -1233,6 +1313,156 @@ def _build_fields_from_args(cfg: dict, field_args: tuple, model_path: str, *, re
         raw_fields,
         require_all_required=require_all_required,
     )
+
+
+def _resolve_fragment_by_slug(cfg: dict, slug: str, model_path: str) -> str:
+    """Return the fragment id for a slug in a model's folder (single targeted call)."""
+    folder = _folder_for_model(model_path)
+    if not folder:
+        raise click.ClickException(
+            f"Could not determine the folder for model '{model_path}'. Pass an id instead."
+        )
+    frag_path = f"{folder}/{slug}"
+    results = t.list_fragments(cfg, path=frag_path, limit=5)
+    for f in results.get("items", []):
+        if f.get("path", "").rstrip("/") == frag_path and f.get("id"):
+            return f["id"]
+    raise click.ClickException(f"No fragment found with slug '{slug}' in {folder}.")
+
+
+def _pick_numbered(label: str, count: int) -> int:
+    """Prompt for a 1-based selection in [1, count]; returns the chosen index."""
+    while True:
+        raw = click.prompt(click.style(f"{label} [1-{count}]", fg="cyan"), default="1")
+        try:
+            i = int(raw)
+            if 1 <= i <= count:
+                return i
+        except ValueError:
+            pass
+        _failure(f"Enter a number between 1 and {count}.")
+
+
+def _interactive_select_fragment(cfg: dict) -> str:
+    """Pick a model, optionally filter, list matching fragments, and select one.
+
+    Returns the chosen fragment id — so a user never has to know/type a UUID.
+    """
+    with _spinner("Fetching models..."):
+        models = t.list_models(cfg, limit=50).get("items", [])
+    if not models:
+        raise click.ClickException("No models found on this environment.")
+
+    _header("\nSelect model:")
+    for i, m in enumerate(models, 1):
+        name = m.get("path", "").rstrip("/").rsplit("/", 1)[-1]
+        click.echo("  " + click.style(f"{i}.", fg="cyan") + f" {m.get('title') or name}")
+    model = models[_pick_numbered("Model", len(models)) - 1]
+    model_path = model["path"]
+    folder = environments.MODEL_DEFAULTS.get(model_path) or model_path
+
+    term = click.prompt(
+        click.style("Filter by name/slug (Enter for all)", fg="cyan"),
+        default="", show_default=False,
+    ).strip().lower()
+
+    matches: list[dict] = []
+
+    # Fast path: if the filter is an exact slug, one targeted call resolves it without
+    # scanning the whole folder (the AEM search endpoint is unusable, so a partial
+    # filter still requires a full listing — but an exact slug does not).
+    if term:
+        try:
+            r = t.list_fragments(cfg, path=f"{folder}/{term}", limit=5)
+            for f in r.get("items", []):
+                if f.get("path", "").rstrip("/") == f"{folder}/{term}":
+                    matches.append({"id": f.get("id"),
+                                    "slug": term,
+                                    "title": f.get("title", "") or ""})
+        except (Exception, SystemExit):
+            pass  # fall through to the full scan
+
+    # Full scan + client-side substring filter (needed for partial filters / "list all").
+    if not matches:
+        cursor = None
+        with _spinner("Loading fragments..."):
+            for _ in range(60):  # cap: 60 pages * 50
+                r = t.list_fragments(cfg, path=folder, limit=50, cursor=cursor)
+                for f in r.get("items", []):
+                    slug = f.get("path", "").rstrip("/").rsplit("/", 1)[-1]
+                    title = f.get("title", "") or ""
+                    if not term or term in slug.lower() or term in title.lower():
+                        matches.append({"id": f.get("id"), "slug": slug, "title": title})
+                cursor = r.get("cursor")
+                if not cursor:
+                    break
+
+    if not matches:
+        where = f"matching '{term}' " if term else ""
+        raise click.ClickException(f"No fragments {where}in {folder}.")
+
+    matches.sort(key=lambda m: m["slug"])
+    _header(f"\n{len(matches)} match(es):")
+    for i, m in enumerate(matches, 1):
+        label = m["slug"] + (f"   ({m['title']})" if m["title"] else "")
+        click.echo("  " + click.style(f"{i}.", fg="cyan") + f" {label}")
+    chosen = matches[_pick_numbered("Select", len(matches)) - 1]
+    _success(f"Editing: {chosen['slug']}")
+    return chosen["id"]
+
+
+def _format_current_value(field: dict, values: list) -> str:
+    """Compact one-line display of a field's current value for the edit prompt.
+
+    Long-text (markdown guide) content is summarised rather than dumped, and any long
+    single value is truncated, so the prompt stays readable.
+    """
+    if not values:
+        return "(empty)"
+    joined = ", ".join(values)
+    ftype = field.get("fieldType") or field.get("type", "")
+    if ftype == "long-text":
+        first_line = next((ln.strip() for ln in joined.splitlines() if ln.strip()), "")
+        preview = (first_line[:50] + "…") if len(first_line) > 50 else first_line
+        return f"existing content — {len(joined)} chars" + (f' (starts: "{preview}")' if preview else "")
+    return (joined[:77] + "…") if len(joined) > 80 else joined
+
+
+def _interactive_edit_fields(cfg: dict, schema_fields: list, current_values: dict, allowed: set | None) -> tuple:
+    """Prompt each editable field showing its current value (Enter keeps it).
+
+    Each entered value is validated inline (asset existence, regex, maxLength, enum,
+    markdown DAM refs) so a bad value is caught and re-prompted immediately — not after
+    the whole form is filled in. Returns a tuple of NAME=VALUE strings for changed
+    fields. Only fields in `allowed` (the journey's editable set) are offered; if
+    `allowed` is None, fall back to everything that isn't immutable/deprecated/system.
+    """
+    if allowed is not None:
+        editable = [f for f in schema_fields if f.get("name") in allowed]
+    else:
+        skip = IMMUTABLE_ON_UPDATE | DEPRECATED_FIELDS | {"content_type"}
+        editable = [f for f in schema_fields if f.get("name") not in skip]
+    _header("\nEdit fields — press Enter to skip (keep the current value):")
+    edits = []
+    for f in editable:
+        name = f.get("name")
+        cur_disp = _format_current_value(f, current_values.get(name, []))
+        _hint(f"\n  current: {cur_disp}   —   Enter to keep")
+        # Prompt exactly like create (numbered lists for enums, list+free-text for
+        # solution_tags, file path for the guide) so the experience matches. The field
+        # is treated as optional here so a blank entry keeps the current value — even
+        # for required fields. Each value is validated inline by these prompts.
+        field_opt = {**f, "required": False}
+        if name == "solution_tags":
+            val = _prompt_solution_tags(cfg, field_opt)
+        else:
+            val = _prompt_field_value(cfg, field_opt)
+        if val is None:
+            continue  # kept the current value
+        edits.append(f"{name}={val}")
+    if not edits:
+        raise click.ClickException("No changes entered — nothing to update.")
+    return tuple(edits)
 
 
 @fragments.command("create")
@@ -1333,21 +1563,42 @@ def create_fragment(interactive, parent_path, model_path, name, field_args, fiel
 
 
 @fragments.command("update")
-@click.argument("id")
+@click.argument("id", required=False)
+@click.option("-i", "--interactive", "interactive", is_flag=True,
+              help="Pick the fragment from a list (no id needed).")
+@click.option("--slug", default=None, help="Resolve the fragment by slug (needs --model-path).")
+@click.option("--model-path", "model_path_opt", default=None, help="Model path for --slug lookup.")
 @click.option("--title",  default=None, help="New fragment title")
 @click.option("-f", "--field", "field_args", multiple=True, metavar="NAME=VALUE",
               help="Field value as name=value. Repeatable. Multi-value: comma-separate.")
 @click.option("--patch",  default=None, help="Raw JSON Patch array (advanced)")
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON")
-def update_fragment(id, title, field_args, patch, as_json):
+def update_fragment(id, interactive, slug, model_path_opt, title, field_args, patch, as_json):
     """Update a content fragment.
 
+    Identify the fragment by id, by --slug (+ --model-path), or interactively with -i.
+
     Examples:\n
-      --title \"New Title\"\n
-      -f slug=\"new-slug\" -f description=\"New desc.\"\n
-      --patch '[{\"op\":\"replace\",\"path\":\"/title\",\"value\":\"...\"}]'
+      update -i -f description="New desc."          # pick from a list, no id\n
+      update --slug workday-hr-connector --model-path "$CONN_M" -f description="New desc."\n
+      update <id> --title "New Title"\n
+      update <id> -f slug="new-slug" -f description="New desc."
     """
     cfg = _cfg()
+
+    # Resolve the fragment id when not given directly.
+    if not id:
+        if interactive:
+            id = _interactive_select_fragment(cfg)
+        elif slug:
+            if not model_path_opt:
+                raise click.UsageError("--slug requires --model-path.")
+            id = _resolve_fragment_by_slug(cfg, slug, model_path_opt)
+        else:
+            raise click.UsageError(
+                "Provide a fragment id, or use -i to pick one, or --slug with --model-path."
+            )
+
     fragment = t.get_fragment(cfg, id=id)
     etag = fragment.get("_etag")
     if not etag:
@@ -1364,6 +1615,12 @@ def update_fragment(id, title, field_args, patch, as_json):
         for f in fragment_fields
         if f.get("name")
     }
+
+    editable = _editable_fields_for(model_path)
+
+    # -i with no explicit -f/--title/--patch → prompt the editable fields inline.
+    if interactive and not field_args and not title and not patch:
+        field_args = _interactive_edit_fields(cfg, schema_fields, effective_values, editable)
 
     if title:
         patch_ops.append({"op": "replace", "path": "/title", "value": title})
@@ -1391,6 +1648,11 @@ def update_fragment(id, title, field_args, patch, as_json):
             if name in IMMUTABLE_ON_UPDATE:
                 raise click.ClickException(
                     f"Field '{name}' cannot be changed after creation."
+                )
+            if editable is not None and name not in editable:
+                raise click.ClickException(
+                    f"Field '{name}' is not editable on update. "
+                    f"Editable fields: {', '.join(sorted(editable))}."
                 )
             if name in field_index:
                 idx = field_index[name]
