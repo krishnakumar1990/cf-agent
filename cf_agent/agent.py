@@ -1428,6 +1428,15 @@ def _format_current_value(field: dict, values: list) -> str:
     return (joined[:77] + "…") if len(joined) > 80 else joined
 
 
+def _is_review_locked(fragment: dict) -> bool:
+    """True if the fragment was sent to review (reviewRequired = true), which locks it
+    in AEM's approval workflow so it can't be modified until the review is released."""
+    for f in fragment.get("fields", []):
+        if f.get("name") == "reviewRequired":
+            return any(str(v).strip().lower() == "true" for v in (f.get("values") or []))
+    return False
+
+
 def _interactive_edit_fields(cfg: dict, schema_fields: list, current_values: dict, allowed: set | None) -> tuple:
     """Prompt each editable field showing its current value (Enter keeps it).
 
@@ -1600,6 +1609,18 @@ def update_fragment(id, interactive, slug, model_path_opt, title, field_args, pa
             )
 
     fragment = t.get_fragment(cfg, id=id)
+
+    # Fail fast BEFORE prompting: a fragment sent to review is locked in AEM, so AEM
+    # would reject the write at the end anyway. Tell the user now instead of after they
+    # fill in the whole form.
+    if _is_review_locked(fragment):
+        raise click.ClickException(
+            f"'{fragment.get('title') or id}' is in review and locked — it can't be edited "
+            "until the review is completed or cancelled in AEM.\n"
+            "Ask a reviewer/admin to release it (or, in AEM, complete/cancel its review), "
+            "then try again."
+        )
+
     etag = fragment.get("_etag")
     if not etag:
         raise click.ClickException("Could not retrieve ETag for fragment.")
