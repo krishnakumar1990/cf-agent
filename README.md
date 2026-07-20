@@ -1,14 +1,42 @@
 # cf-agent
 
-CLI for managing Adobe AEM Content Fragments — Moveworks Marketplace.
+A command-line tool for managing **Adobe AEM Content Fragments** for the Moveworks Marketplace — connectors and plugins.
 
-Supports interactive guided mode and one-liner commands for creating, reading, updating, deleting, and publishing Content Fragments across PROD, STAGE, and DEV environments.
+Create, edit, publish, and inspect fragments across **PROD / STAGE / DEV** with an interactive guided mode or scriptable one-liners. Every rule (field types, allowed values, length limits, required fields) is read **live from the AEM model**, so the CLI always matches what AEM enforces.
 
 ---
 
-## Quick Start
+## Features
 
-Copy-paste this single block to create an isolated environment, install `cf-agent`, and log in to AEM. Requires **Python 3.10+**.
+- **Interactive guided mode** (`-i`) for creating and editing — pick from lists, see field descriptions, validate as you type.
+- **Scriptable one-liners** (`-f name=value`) for automation.
+- **Edit without a UUID** — find and select a fragment by model + name filter, or by slug.
+- **Live validation** against the model: required fields, enums, max-length, regex, kebab-case slugs, duplicate-slug detection, and cross-field rules.
+- **Content guides from markdown files**, with automatic checking that every referenced AEM image exists.
+- **Smart defaults** — logo/asset folders auto-prefixed, plugin slugs seeded with the system name, model folders chosen automatically.
+- **Guardrails** — immutable fields and review-locked fragments are caught up front, not after you fill in a form.
+- **Command history** — ↑/↓ recall previous entries in interactive prompts.
+
+---
+
+## Table of Contents
+
+- [Installation](#installation)
+- [Authentication](#authentication)
+- [Environments](#environments)
+- [Field reference](#field-reference)
+- [Creating a fragment](#creating-a-fragment)
+- [Updating a fragment](#updating-a-fragment)
+- [Content guides & images](#content-guides--images)
+- [Other fragment commands](#other-fragment-commands)
+- [Models & assets](#models--assets)
+- [Troubleshooting / Debug](#troubleshooting--debug)
+
+---
+
+## Installation
+
+Requires **Python 3.10+**. Install into a virtual environment to keep it isolated.
 
 ```bash
 # 1. Create & activate a virtual environment
@@ -18,586 +46,294 @@ source ~/.venvs/cf-agent/bin/activate
 # 2. Install cf-agent
 pip install "git+https://github.com/krishnakumar1990/cf-agent.git"
 
-# 3. Log in to AEM (opens your browser)
-cf-agent login
-```
-
-During login you'll be prompted for your **Adobe Client ID** and **Client Secret**; a browser then opens for Adobe IMS login, and finally you select an environment (PROD / STAGE / DEV). That's it — you're ready to run commands like `cf-agent fragments create -i`.
-
-> New terminal later? Just re-activate the environment first: `source ~/.venvs/cf-agent/bin/activate`
-> To have it activate automatically in every shell: `echo 'source ~/.venvs/cf-agent/bin/activate' >> ~/.zshrc`
-
-See [Installation](#installation) and [Authentication](#authentication) below for more detail and options.
-
----
-
-## Table of Contents
-
-- [Quick Start](#quick-start)
-- [Installation](#installation)
-- [Authentication](#authentication)
-- [Environment Management](#environment-management)
-- [Fragments](#fragments)
-  - [list](#list)
-  - [get](#get)
-  - [search](#search)
-  - [create](#create)
-  - [update](#update)
-  - [delete](#delete)
-  - [publish](#publish)
-  - [copy](#copy)
-  - [variations](#variations)
-- [Models](#models)
-- [Assets](#assets)
-- [Diagnostics](#diagnostics)
-- [Upgrading](#upgrading)
-
----
-
-## Installation
-
-Requires Python 3.10 or later.
-
-### Recommended: install into a virtual environment
-
-Using a virtual environment keeps `cf-agent` isolated from your system Python and avoids dependency conflicts.
-
-```bash
-# Create and activate a virtual environment
-python3 -m venv ~/.venvs/cf-agent
-source ~/.venvs/cf-agent/bin/activate
-
-# Install cf-agent
-pip install "git+https://github.com/krishnakumar1990/cf-agent.git"
-```
-
-Add the activation line to your shell profile (e.g. `~/.zshrc` or `~/.bashrc`) so the environment is active in every new terminal:
-
-```bash
-echo 'source ~/.venvs/cf-agent/bin/activate' >> ~/.zshrc
-```
-
-### Verify the installation
-
-```bash
+# 3. Verify
 cf-agent --help
 ```
+
+**New terminal later?** Re-activate first: `source ~/.venvs/cf-agent/bin/activate`
+To auto-activate in every shell: `echo 'source ~/.venvs/cf-agent/bin/activate' >> ~/.zshrc`
+
+> To upgrade, uninstall, or reinstall, see [Troubleshooting / Debug](#troubleshooting--debug).
 
 ---
 
 ## Authentication
 
-Authentication uses Adobe IMS OAuth (browser-based login). Credentials are stored in `~/.cf-agent/config` and tokens in `~/.cf-agent/tokens`.
+Login uses Adobe IMS OAuth (browser-based). Credentials are stored in `~/.cf-agent/config`, tokens in `~/.cf-agent/tokens`.
 
-### First-time login
+```bash
+cf-agent login          # prompts for Adobe Client ID + Secret, opens browser, then pick an environment
+cf-agent whoami         # show the authenticated user, org, scopes, and active environment
+cf-agent logout         # clear stored tokens
+```
 
-Use the shared preset file to pre-fill team configuration:
+If your team shares a preset with pre-filled config:
 
 ```bash
 cf-agent login --preset shared.env
 ```
 
-You will be prompted for:
-- **Adobe Client ID** — from your Adobe Developer Console OAuth app
-- **Adobe Client Secret** — from your Adobe Developer Console OAuth app
+Tokens expire; if you see **"Not logged in"** or a **401**, run `cf-agent login` again.
 
-The browser will open for Adobe IMS login. After completing the login, you will be prompted to select an AEM environment (PROD, STAGE, or DEV).
+---
 
-### Login without a preset
+## Environments
 
-```bash
-cf-agent login
-```
-
-You will be prompted only for your **Adobe Client ID** and **Adobe Client Secret**. Scopes and the redirect URI use built-in defaults (no prompt), then the browser opens for login and you select an environment. This is the simplest path and needs no `shared.env` file — it's the same command used in the [Quick Start](#quick-start).
-
-### Logout
-
-Clears stored OAuth tokens. Does not remove credentials.
+One login works across all environments. The **active** environment is where every fragment operation runs.
 
 ```bash
-cf-agent logout
-```
-
-### Check current identity
-
-Decodes the active access token and shows the authenticated user, IMS org, scopes, and selected environment.
-
-```bash
-cf-agent whoami
-```
-
-Example output:
-```
-User:        john.doe@company.com
-IMS org:     ims-na1
-Client ID:   99dd32f5fb3844c9af0e838c84b81e44
-Token:       expires in 84231s
-Scopes:      openid,AdobeID,aem.fragments.management,aem.folders
-Environment: https://author-p<PROGRAM_ID>-e<ENV_ID>.adobeaemcloud.com/adobe/sites
+cf-agent env list       # show PROD / STAGE / DEV and which is current
+cf-agent env select     # switch interactively
+cf-agent env current    # show the active environment
 ```
 
 ---
 
-## Environment Management
+## Field reference
 
-One access token works across all environments. The active environment determines where all fragment operations are applied.
+Field names, types, and rules are read from the live model. These are the fields for each type today.
 
-### List available environments
+### Connector (`marketplace-connector`)
 
-```bash
-cf-agent env list
-```
+| Field | Required | Rules |
+|---|---|---|
+| `marketplace_name` | ✅ | Title Case; max 255 |
+| `slug` | ✅ | lowercase kebab-case; contains the system name; unique; **immutable** |
+| `description` | ✅ | ends with `.`; max **400** |
+| `logo` | ✅ | an **SVG hosted in AEM**; enter the file name only (auto-prefixed to the logos folder) |
+| `solution_tags` | ✅ | pick from the list **or** type a new Title Case tag; multiple allowed |
+| `product_family` | ✅ | from the model list (e.g. `Google Cloud`, `Microsoft Graph`) |
+| `content_guide` | — | markdown guide; supply a file path |
+| `video` | — | YouTube / Vimeo / Loom URL |
 
-Example output:
-```
-  1. NOW Moveworks PROD      https://author-p<PROGRAM_ID>-e<ENV_ID_PROD>.adobeaemcloud.com/adobe/sites
-  2. NOW Moveworks STAGE     https://author-p<PROGRAM_ID>-e<ENV_ID_STAGE>.adobeaemcloud.com/adobe/sites (current)
-  3. NOW Moveworks DEV       https://author-p<PROGRAM_ID>-e<ENV_ID_DEV>.adobeaemcloud.com/adobe/sites
-```
+### Plugin (`marketplace-plugin`)
 
-### Switch environment interactively
+| Field | Required | Rules |
+|---|---|---|
+| `marketplace_name` | ✅ | Title Case; must **not** include the system name; max 255 |
+| `slug` | ✅ | lowercase kebab-case; **must start with a system** (e.g. `workday-view-pto`); unique; **immutable** |
+| `description` | ✅ | ends with `.`; max **400** |
+| `availability` | ✅ | from the model (`VALIDATED`, `INSTALLABLE`, `IDEA`, `BUILT_IN`); **immutable** after create |
+| `installation_asset_uuid` | ⛔/✅ | **required when `availability = INSTALLABLE`**, forbidden otherwise; lowercase UUID |
+| `solution_tags` | ✅ | pick from the list **or** type a new Title Case tag; multiple allowed |
+| `purple_chat_link` | ✅ | starts with `https://marketplace.moveworks.com/purple-chat?conversation`; no `mock_id`; max 30000 |
+| `systems` | ✅ | from the model list; multiple allowed; **immutable** |
+| `agent_capabilities` | — | from the model list (e.g. `Ambient Agent`) |
+| `content_guide` | — | markdown guide; supply a file path |
+| `video` | — | YouTube / Vimeo / Loom URL |
 
-```bash
-cf-agent env select
-```
-
-### Show current environment
-
-```bash
-cf-agent env current
-```
-
-### Set environment manually
-
-```bash
-cf-agent env use https://author-p<PROGRAM_ID>-e<ENV_ID>.adobeaemcloud.com/adobe/sites
-```
-
----
-
-## Fragments
-
-All fragment commands operate against the currently selected environment.
+> **Field names come from the live model** — the interactive prompts always show the exact current name. `installation_asset_uuid` was formerly `installation_uuid`; the CLI accepts both during the transition.
+>
+> **`reviewRequired`** — setting this to `true` sends the fragment to review, which **locks it** from further edits until an approver releases it. Leave it off until the content is final.
 
 ---
 
-### list
+## Creating a fragment
 
-List content fragments, optionally filtered by folder path.
-
-```bash
-cf-agent fragments list [OPTIONS]
-```
-
-| Option | Description |
-|---|---|
-| `--path` | Filter by DAM folder path |
-| `--limit` | Max results (default: 10) |
-| `--cursor` | Pagination cursor from previous response |
-| `--references` | Include references: `DIRECT` or `TRANSITIVE` |
-| `--json` | Output raw JSON |
-
-**Examples:**
-
-```bash
-# List 10 fragments
-cf-agent fragments list
-
-# List fragments in a specific folder
-cf-agent fragments list --path /content/dam/marketplace/content-fragment-resources/connector
-
-# Paginate
-cf-agent fragments list --limit 25
-cf-agent fragments list --limit 25 --cursor <cursor-from-previous-output>
-```
-
----
-
-### get
-
-Get a single content fragment by ID.
-
-```bash
-cf-agent fragments get <ID> [--json]
-```
-
-**Example:**
-
-```bash
-cf-agent fragments get c84afcfd-1950-42d7-9842-9667d81e7e2a
-```
-
-Example output:
-```
-ID:     c84afcfd-1950-42d7-9842-9667d81e7e2a
-Title:  Krishna Demo
-Path:   /content/dam/marketplace/content-fragment-resources/connector/krishna-demo
-Model:  /conf/marketplace/settings/dam/cfm/models/marketplace-connector
-ETag:   "abc123"
-
-Fields:
-  marketplace_name: ['Krishna Demo']
-  slug: ['krishna-demo']
-  description: ['Krishna demo.']
-```
-
----
-
-### search
-
-Full-text search across content fragments.
-
-```bash
-cf-agent fragments search <QUERY> [OPTIONS]
-```
-
-| Option | Description |
-|---|---|
-| `--path` | Scope search to a folder path |
-| `--limit` | Max results (default: 10) |
-| `--json` | Output raw JSON |
-
-**Examples:**
-
-```bash
-cf-agent fragments search "workday"
-
-cf-agent fragments search "PTO" --path /content/dam/marketplace/content-fragment-resources/plugin
-```
-
----
-
-### create
-
-Create a new content fragment.
-
-#### Interactive mode (recommended for first use)
-
-Guides you step by step — picks model from a list, shows field descriptions, validates each field before moving on, and supports reading Content Guide from a markdown file.
+### Interactive (recommended)
 
 ```bash
 cf-agent fragments create -i
 ```
 
-#### One-liner mode — Connector
+Walks you through it: pick the model, then it fills the folder automatically and prompts each field with its rules. For plugins it asks for `systems` first and pre-seeds the slug (`workday-…`); `installation_asset_uuid` is only asked when availability is `INSTALLABLE`. Each value is validated as you enter it.
+
+### One-liner — Connector
 
 ```bash
 cf-agent fragments create \
   --parent-path "/content/dam/marketplace/content-fragment-resources/connector" \
-  --model-path "/conf/marketplace/settings/dam/cfm/models/marketplace-connector" \
-  --name "workday-benefits-connector" \
-  --title "Workday Benefits Connector" \
-  -f marketplace_name="Workday Benefits Connector" \
-  -f slug="workday-benefits-connector" \
-  -f description="Connects to Workday to retrieve employee benefits information." \
-  -f availability="VALIDATED" \
-  -f solution_tags="HR - Benefits,HR - Employee Records" \
-  -f logo="workday.svg" \
-  -f product_family="google-cloud" \
-  -f video="https://youtu.be/CCEYG_K9Pzg" \
-  -f content_guide=~/Desktop/connector-guide.md \
-  -f reviewRequired="true"
+  --model-path  "/conf/marketplace/settings/dam/cfm/models/marketplace-connector" \
+  --name  "google-drive-connector" \
+  --title "Google Drive Connector" \
+  -f marketplace_name="Google Drive Connector" \
+  -f slug="google-drive-connector" \
+  -f description="Connects to Google Drive to search and retrieve files." \
+  -f logo="google-drive.svg" \
+  -f solution_tags="IT,Productivity" \
+  -f product_family="Google Workspace" \
+  -f content_guide=~/Desktop/connector-guide.md
 ```
 
-#### One-liner mode — Plugin
+### One-liner — Plugin
 
 ```bash
 cf-agent fragments create \
   --parent-path "/content/dam/marketplace/content-fragment-resources/plugin" \
-  --model-path "/conf/marketplace/settings/dam/cfm/models/marketplace-plugin" \
-  --name "workday-view-pto-balance" \
+  --model-path  "/conf/marketplace/settings/dam/cfm/models/marketplace-plugin" \
+  --name  "workday-view-pto-balance" \
   --title "View PTO Balance" \
   -f marketplace_name="View PTO Balance" \
   -f slug="workday-view-pto-balance" \
-  -f description="Allows employees to check their current PTO balance directly from the Moveworks AI Assistant." \
+  -f description="Check your current PTO balance from the Moveworks AI Assistant." \
   -f availability="VALIDATED" \
   -f solution_tags="HR - Time & Absence,HR - Employee Records" \
   -f purple_chat_link="https://marketplace.moveworks.com/purple-chat?conversation=%7B%22messages%22%3A%5B%5D%7D" \
   -f systems="workday" \
   -f agent_capabilities="Ambient Agent" \
-  -f video="https://youtu.be/CCEYG_K9Pzg" \
-  -f content_guide=~/Desktop/plugin-guide.md \
-  -f reviewRequired="true"
+  -f content_guide=~/Desktop/plugin-guide.md
 ```
 
-#### `-f` flag reference
+For an **INSTALLABLE** plugin, use `-f availability="INSTALLABLE"` and add `-f installation_asset_uuid="34cff60f-f3c8-48f9-b1c9-7658ead0d994"`.
 
-| Field | Model | Type | Notes |
-|---|---|---|---|
-| `marketplace_name` | Both | text | Title Case, max 255 chars |
-| `slug` | Both | text | Kebab-case, e.g. `my-plugin-name` |
-| `description` | Both | text | Must end with a period, max 2000 chars |
-| `availability` | Both | enumeration | `IDEA`, `BUILT_IN`, `VALIDATED`, `INSTALLABLE` |
-| `solution_tags` | Both | enumeration (multi) | Comma-separate multiple values |
-| `logo` | Connector | content-reference | Filename only, e.g. `workday.svg` |
-| `product_family` | Connector | enumeration | e.g. `google-cloud`, `microsoft-graph` |
-| `purple_chat_link` | Plugin | text | Must be a `marketplace.moveworks.com/purple-chat?conversation=...` URL |
-| `systems` | Plugin | enumeration (multi) | e.g. `workday`, `servicenow,jira` |
-| `agent_capabilities` | Plugin | enumeration (multi) | e.g. `Ambient Agent` |
-| `content_guide` | Both | long-text | File path to a `.md` file, e.g. `~/Desktop/guide.md` |
-| `video` | Both | text | YouTube, Vimeo, or Loom URL |
-| `installation_uuid` | Both | text | Connector: 32 hex chars · Plugin: full UUID format — **required** when `availability=INSTALLABLE` |
-| `reviewRequired` | Both | enumeration | `true` to send for review and lock |
+> Multi-value fields are comma-separated inside one flag: `-f solution_tags="HR - Benefits,IT"`.
 
-#### Validation
+---
 
-Before writing to AEM, `cf-agent` validates every field against the live model schema:
+## Updating a fragment
 
-- **Required fields** — an error is raised if any required field is missing.
-- **Enumeration values** — invalid options are rejected with the list of allowed values.
-- **Max length** — text fields that exceed their configured limit are caught early.
-- **Regex** — fields with a custom validation pattern are checked client-side.
-- **Content references** (`logo`) — the DAM asset path is verified to exist in AEM before the fragment is created. In interactive mode the logo is checked as soon as you enter it, so a typo can be fixed on the spot. See [`asset exists`](#assets) to check any asset manually.
-- **Content guide asset references** — when a `content_guide` markdown file is supplied, every AEM asset it references (`/content/dam/...` image links, markdown links, and `<img>` tags, including full AEM URLs) is verified to exist in the DAM. Creation is blocked, with the missing paths listed, if any reference is broken.
-- **Slug format** — the fragment name must be lowercase kebab-case (e.g. `my-connector`).
-- **Duplicate slugs** — AEM is searched for an existing fragment with the same slug before writing. If one is found, the command exits with an error and the conflicting path.
-- **Cross-field rules** — `installation_uuid` is required when `availability` is `INSTALLABLE`.
+You can identify the fragment **three ways** — no UUID required.
 
-**Multi-value fields** — comma-separate values in a single `-f` flag:
+### 1. Interactive (recommended)
+
 ```bash
--f solution_tags="HR - Benefits,HR - Other"
--f systems="workday,servicenow"
+cf-agent fragments update -i
 ```
 
-**Content guide from file** — provide a file path instead of inline text:
+- Pick the model (connector / plugin).
+- Type a filter (name or slug) — or Enter to list all.
+- Choose from the numbered results.
+- Edit each **editable** field; press **Enter to skip** (keep the current value). Enums show their pick-list, exactly like create.
+
+### 2. By slug (scriptable)
+
+```bash
+cf-agent fragments update --slug google-drive-connector \
+  --model-path "/conf/marketplace/settings/dam/cfm/models/marketplace-connector" \
+  -f content_guide=~/Desktop/updated-guide.md
+```
+
+### 3. By id
+
+```bash
+cf-agent fragments update <id> -f description="Updated description."
+```
+
+### Which fields are editable
+
+Only these fields can be changed on update — everything else is locked.
+
+| Model | Editable fields |
+|---|---|
+| **Connector** | `logo`, `content_guide` |
+| **Plugin** | `marketplace_name`, `description`, `purple_chat_link`, `solution_tags`, `installation_asset_uuid`, `content_guide` |
+
+**Locked (cannot be changed after creation):** `slug`, `systems`, `availability`. Attempting to change one — or to edit any non-listed field — is rejected with a clear message.
+
+> **Review-locked fragments:** if a fragment was sent to review (`reviewRequired = true`), the CLI tells you **immediately on selection** that it's locked and can't be edited until the review is completed or cancelled in AEM — so you don't fill in a form only to be refused at the end.
+
+---
+
+## Content guides & images
+
+`content_guide` is a markdown guide supplied as a **file path** (both create and update):
+
 ```bash
 -f content_guide=~/Desktop/my-guide.md
 ```
 
----
+When you provide the file, the CLI reads it and **verifies every AEM image it references exists**. It checks `/content/dam/...` paths in markdown images `![](…)`, links `[](…)`, and HTML `<img src="…">` (full AEM URLs too). If any referenced image is missing, the operation is blocked and the missing paths are listed.
 
-### update
-
-Update a content fragment by ID. Automatically fetches the ETag — no manual ETag handling needed.
-
-```bash
-cf-agent fragments update <ID> [OPTIONS]
-```
-
-| Option | Description |
-|---|---|
-| `--title` | New fragment title |
-| `-f NAME=VALUE` | Update a field value (repeatable) |
-| `--patch` | Raw JSON Patch array for advanced use |
-| `--json` | Output raw JSON |
-
-**Examples:**
-
-```bash
-# Update title only
-cf-agent fragments update c84afcfd-1950-42d7-9842-9667d81e7e2a \
-  --title "New Title"
-
-# Update one or more fields
-cf-agent fragments update c84afcfd-1950-42d7-9842-9667d81e7e2a \
-  -f description="Updated description." \
-  -f availability="INSTALLABLE"
-
-# Update title and fields together
-cf-agent fragments update c84afcfd-1950-42d7-9842-9667d81e7e2a \
-  --title "New Title" \
-  -f slug="new-slug" \
-  -f solution_tags="HR - Benefits,IT"
-
-# Update content guide from a file
-cf-agent fragments update c84afcfd-1950-42d7-9842-9667d81e7e2a \
-  -f content_guide=~/Desktop/updated-guide.md
-```
+**Workflow for images:** upload the image to AEM first (e.g. under the fragment's folder), reference it by its `/content/dam/...` path in the markdown, then create/update the guide. Relative image paths from a raw export (e.g. `![](image.png)`) are **not** uploaded — reference images by their DAM path.
 
 ---
 
-### delete
-
-Delete a content fragment. Automatically fetches the ETag.
+## Other fragment commands
 
 ```bash
-cf-agent fragments delete <ID> [--yes]
+# List (optionally by folder)
+cf-agent fragments list --path /content/dam/marketplace/content-fragment-resources/connector --limit 25
+
+# Get one by id
+cf-agent fragments get <id>
+
+# Dry-run validate a payload against the model — no write
+cf-agent fragments validate --model-path "$CONN_M" -f description="A connector." --partial
+
+# Publish one or more
+cf-agent fragments publish <id> [<id> ...]
+
+# Delete (‑‑yes to skip the prompt)
+cf-agent fragments delete <id> --yes
+
+# Copy to another folder (‑‑deep to include references)
+cf-agent fragments copy <id> --destination /content/dam/.../archive [--deep]
+
+# List variations
+cf-agent fragments variations <id>
 ```
 
-| Option | Description |
-|---|---|
-| `--yes` | Skip the confirmation prompt |
-
-**Examples:**
-
-```bash
-# With confirmation prompt
-cf-agent fragments delete c84afcfd-1950-42d7-9842-9667d81e7e2a
-
-# Skip prompt (useful in scripts)
-cf-agent fragments delete c84afcfd-1950-42d7-9842-9667d81e7e2a --yes
-```
+> `cf-agent fragments search` exists but the underlying AEM search endpoint is not available on all environments — prefer `fragments list` or the `update -i` filter to find fragments.
 
 ---
 
-### publish
-
-Publish one or more content fragments.
+## Models & assets
 
 ```bash
-cf-agent fragments publish <ID> [<ID> ...]
-```
-
-**Examples:**
-
-```bash
-# Publish one
-cf-agent fragments publish c84afcfd-1950-42d7-9842-9667d81e7e2a
-
-# Publish multiple
-cf-agent fragments publish \
-  c84afcfd-1950-42d7-9842-9667d81e7e2a \
-  6e313b3d-f1c4-4896-bebd-ca75495cbd23
-```
-
----
-
-### copy
-
-Copy a content fragment to a new folder.
-
-```bash
-cf-agent fragments copy <ID> --destination <PATH> [--deep]
-```
-
-| Option | Description |
-|---|---|
-| `--destination` | Destination DAM folder path (required) |
-| `--deep` | Deep copy — includes all referenced fragments |
-
-**Examples:**
-
-```bash
-cf-agent fragments copy c84afcfd-1950-42d7-9842-9667d81e7e2a \
-  --destination /content/dam/marketplace/content-fragment-resources/archive
-
-cf-agent fragments copy c84afcfd-1950-42d7-9842-9667d81e7e2a \
-  --destination /content/dam/marketplace/content-fragment-resources/archive \
-  --deep
-```
-
----
-
-### variations
-
-List all variations of a content fragment.
-
-```bash
-cf-agent fragments variations <ID> [--json]
-```
-
-**Example:**
-
-```bash
-cf-agent fragments variations c84afcfd-1950-42d7-9842-9667d81e7e2a
-```
-
----
-
-## Models
-
-### list
-
-List available Content Fragment Models.
-
-```bash
-cf-agent models list [--path <PATH>] [--limit <N>] [--json]
-```
-
-**Examples:**
-
-```bash
+# List Content Fragment Models (connector, plugin, …)
 cf-agent models list
 
-cf-agent models list --path /conf/marketplace/settings/dam/cfm/models
+# Check whether an asset exists in the DAM (bare name resolved against a known folder)
+cf-agent asset exists workday.svg --logo
+cf-agent asset exists /content/dam/marketplace/logos/workday.svg
 ```
+
+`asset exists` returns exit code `0` if present, `1` if not — usable in scripts. It requires the `aem.assets.author` scope.
 
 ---
 
-## Assets
+## Troubleshooting / Debug
 
-Check whether a logo or image exists in the AEM DAM. This uses the AEM Assets Author API (asset search) — the same verification applied automatically to the `logo` field and to any `/content/dam/...` references inside a content guide during [`fragments create`](#create).
-
-### exists
-
-```bash
-cf-agent asset exists <ASSET_REF> [--logo | --image | --root <DAM_PATH>] [--json]
-```
-
-`ASSET_REF` may be a **full DAM path**, or a **bare file name** when one of the folder flags is supplied:
-
-| Flag | Resolves a bare name against |
-| --- | --- |
-| `--logo` | `/content/dam/marketplace/logos` |
-| `--image` | `/content/dam/marketplace/images` |
-| `--root <DAM_PATH>` | the folder you specify (e.g. `/content/dam/marketplace/screenshots`) |
-
-Only one of `--logo`, `--image`, or `--root` may be used at a time. A bare name with none of them is rejected.
-
-**Examples:**
-
-```bash
-# Bare file name resolved against the logos folder
-cf-agent asset exists smartsheet.png --logo
-
-# Bare file name resolved against the images folder
-cf-agent asset exists banner.png --image
-
-# Full DAM path (no flag needed)
-cf-agent asset exists /content/dam/marketplace/logos/smartsheet.png
-
-# Any other folder
-cf-agent asset exists diagram.png --root /content/dam/marketplace/screenshots
-
-# Machine-readable output
-cf-agent asset exists smartsheet.png --logo --json
-```
-
-**Example output:**
-
-```
-✓ Asset exists: /content/dam/marketplace/logos/smartsheet.png
-```
-
-```json
-{
-  "path": "/content/dam/marketplace/logos/smartsheet.png",
-  "exists": true
-}
-```
-
-**Exit codes:** `0` if the asset exists, `1` if it does not — so the command can be used directly in scripts:
-
-```bash
-if cf-agent asset exists smartsheet.png --logo; then
-  echo "Logo is present"
-fi
-```
-
-> **Note:** requires the access token to carry the `aem.assets.author` scope. Without it the Assets API returns 403 and the check fails loudly rather than silently passing.
-
----
-
-## Diagnostics
-
-### whoami
-
-Inspect the active access token and environment selection.
-
-```bash
-cf-agent whoami
-```
-
-Useful for debugging 403 errors — checks whether the token's IMS org matches the AEM environment.
-
----
-
-## Upgrading
-
-Pull the latest version from GitHub. If you installed into a virtual environment, activate it first:
+### Update the CLI to the latest version
 
 ```bash
 source ~/.venvs/cf-agent/bin/activate
 pip install --upgrade "git+https://github.com/krishnakumar1990/cf-agent.git"
+cf-agent --help        # confirm it still runs
 ```
+
+### Uninstall & reinstall
+
+```bash
+source ~/.venvs/cf-agent/bin/activate
+
+# uninstall
+pip uninstall cf-agent
+
+# reinstall (fresh copy)
+pip install "git+https://github.com/krishnakumar1990/cf-agent.git"
+```
+
+For a completely clean slate, delete and recreate the virtual environment:
+
+```bash
+deactivate 2>/dev/null
+rm -rf ~/.venvs/cf-agent
+python3 -m venv ~/.venvs/cf-agent
+source ~/.venvs/cf-agent/bin/activate
+pip install "git+https://github.com/krishnakumar1990/cf-agent.git"
+```
+
+> Uninstalling does **not** remove your login. Config and tokens live in `~/.cf-agent/` — delete that folder to fully reset (`rm -rf ~/.cf-agent`), then `cf-agent login` again.
+
+### Common errors
+
+| Message | Cause & fix |
+|---|---|
+| `Not logged in` / `401` | Token expired → `cf-agent login`. |
+| `403 Forbidden — You are not allowed to modify this fragment` | The fragment is **review-locked** (`reviewRequired = true`) or your Adobe ID lacks write access on this environment. Release the review in AEM, or ask an admin for access. |
+| `… is in review and locked` | Sent to review — complete/cancel the review in AEM, then retry. |
+| `Field 'X' is not editable on update` | Only the editable fields above can change on update. |
+| `Field 'X' cannot be changed after creation` | `slug` / `systems` / `availability` are immutable. |
+| `Slug '…' is already in use` | Choose a unique slug. |
+| `Referenced asset does not exist in AEM` | The logo / a content-guide image isn't in the DAM — upload it first (`cf-agent asset exists …` to check). |
+| `cf-agent: command not found` | The venv isn't active → `source ~/.venvs/cf-agent/bin/activate`. |
+
+### Inspect your session
+
+```bash
+cf-agent whoami        # user, org, scopes, token expiry, active environment
+cf-agent env current   # which environment you're pointed at
+```
+
+`whoami` is the fastest way to debug `403`s — confirm the token's org matches the environment.
