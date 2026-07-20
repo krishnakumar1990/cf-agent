@@ -991,22 +991,48 @@ def _prompt_solution_tags(cfg: dict, field: dict) -> str | None:
                 continue
             return None
 
+        tokens = [t.strip() for t in raw.split(",")]
+        tokens = [t for t in tokens if t]
+        if not tokens:
+            click.echo("  Enter at least one number from the list, or a new Title Case tag.")
+            continue
+
         chosen: list[str] = []
-        for tok in raw.split(","):
-            tok = tok.strip()
-            if not tok:
+        error = ""
+        for tok in tokens:
+            # A plain number selects from the list (single number needs no comma).
+            if tok.isdigit():
+                n = int(tok)
+                if 1 <= n <= len(options):
+                    chosen.append(options[n - 1]["value"])
+                else:
+                    error = f"  '{tok}' is not in the list — pick a number between 1 and {len(options)}."
+                    break
                 continue
-            if tok.isdigit() and 1 <= int(tok) <= len(options):
-                chosen.append(options[int(tok) - 1]["value"])
-            else:
-                chosen.append(tok)  # new free-text value
+
+            # Several numbers typed without commas, e.g. "1 2 3" — guide, don't guess.
+            parts = tok.split()
+            if len(parts) > 1 and all(p.isdigit() for p in parts):
+                error = (f"  Separate multiple selections with commas — try '{','.join(parts)}' "
+                         f"(not spaces).")
+                break
+
+            # Otherwise it's a new custom tag: must be text, in Title Case.
+            if not any(ch.isalpha() for ch in tok):
+                error = f"  A custom tag must be text, not just numbers: '{tok}'."
+                break
+            if not _TITLE_CASE_TAG.match(tok):
+                error = (f"  New tags must be Title Case (e.g. 'Retail Store Services'). "
+                         f"Invalid: {tok}")
+                break
+            chosen.append(tok)
+
+        if error:
+            click.echo(error)
+            continue
 
         seen: set[str] = set()
         tags = [c for c in chosen if not (c in seen or seen.add(c))]
-        bad = [c for c in tags if not _TITLE_CASE_TAG.match(c)]
-        if bad:
-            click.echo(f"  New tags must be Title Case (e.g. 'Retail Store Services'). Invalid: {', '.join(bad)}")
-            continue
         return ",".join(tags)
 
 
