@@ -53,6 +53,34 @@ def _hint(msg: str) -> None:
     click.secho(msg, fg="bright_black")
 
 
+# ── interactive navigation ────────────────────────────────────────────────────
+# Typing one of these at any interactive prompt goes back to the previous step.
+# A ":" prefix is used so it can never collide with a real field value.
+BACK_WORDS = {":back", ":b"}
+
+
+class _Sentinel:
+    """Distinct non-string return values for interactive prompts."""
+
+    def __init__(self, label: str):
+        self._label = label
+
+    def __repr__(self) -> str:
+        return self._label
+
+
+BACK = _Sentinel("<BACK>")  # user wants the previous step
+SKIP = _Sentinel("<SKIP>")  # step doesn't apply (e.g. uuid when not INSTALLABLE)
+
+
+def _is_back(raw) -> bool:
+    return isinstance(raw, str) and raw.strip().lower() in BACK_WORDS
+
+
+def _back_hint() -> None:
+    _hint("  (type :back to return to the previous step)")
+
+
 @contextlib.contextmanager
 def _spinner(message: str):
     """Animated spinner shown on stderr while a slow (usually network) block runs.
@@ -943,6 +971,8 @@ def _prompt_enum(label: str, options: list[dict], required: bool, multiple: bool
 
     while True:
         raw = click.prompt(click.style("  Choice", fg="cyan"), default="", show_default=False).strip()
+        if _is_back(raw):
+            return BACK
         if not raw:
             if required:
                 _failure("  This field is required.")
@@ -985,6 +1015,8 @@ def _prompt_solution_tags(cfg: dict, field: dict) -> str | None:
 
     while True:
         raw = click.prompt("  Value", default="", show_default=False).strip()
+        if _is_back(raw):
+            return BACK
         if not raw:
             if required:
                 click.echo("  This field is required.")
@@ -1067,6 +1099,8 @@ def _prompt_field_value(cfg: dict, field: dict) -> str | None:
         _hint("  Pasting multi-line markdown directly may fail due to shell interpretation.")
         while True:
             value = click.prompt(click.style("  Value or file path", fg="cyan"), default="", show_default=False).strip()
+            if _is_back(value):
+                return BACK
             if not value:
                 if required:
                     _failure("  This field is required.")
@@ -1119,6 +1153,8 @@ def _prompt_field_value(cfg: dict, field: dict) -> str | None:
 
     while True:
         value = click.prompt(click.style("  Value", fg="cyan"), default="", show_default=False).strip()
+        if _is_back(value):
+            return BACK
         if not value:
             if required:
                 _failure("  This field is required.")
@@ -1214,100 +1250,159 @@ def _interactive_create(cfg) -> dict:
             prompt_suffix=": ",
         )
 
-    # ── systems first (plugin only) → derive the slug prefix ──────────────────
-    # A plugin slug must start with one of its systems (e.g. "tableau-export-view"),
-    # so we ask for `systems` up front and pre-seed the name prompt with "<system>-".
-    # The user then only types the action part. Connectors have no `systems`, so this
-    # is skipped and the name prompt is plain.
+    # ── step-driven prompting (type ":back" to return to the previous step) ───
+    # Answers are kept in `answers`, keyed by step, so going back re-shows what you
+    # entered (Enter keeps it). Steps that don't apply — e.g. the installation UUID
+    # when availability isn't INSTALLABLE — are skipped in whichever direction you
+    # are moving, and their stale answer is dropped.
     schema = _schema_map(schema_fields) if schema_fields else {}
     systems_field = schema.get("systems")
-    systems_values: list = []
-    slug_prefix = ""
-    if systems_field:
-        value = _prompt_field_value(cfg, systems_field)
-        systems_values = [v.strip() for v in (value or "").split(",") if v.strip()]
-        if systems_values:
-            slug_prefix = f"{systems_values[0]}-"
+    promptable = [
+        f for f in schema_fields
+        if f.get("name") not in ("slug", "systems")
+        and f.get("name") not in DEPRECATED_FIELDS
+    ] if schema_fields else []
 
-    # The fragment name IS the slug — asked once, reused for both. For plugins the
-    # slug prefix is shown pre-filled; the user types the rest. We validate the full
-    # slug and check for a duplicate up front so it's caught here (re-prompt) rather
-    # than after every other field is filled in.
-    while True:
-        typed = click.prompt(
-            click.style("Fragment name (slug, kebab-case)", fg="cyan"),
-            prompt_suffix=f": {slug_prefix}",
-            default="", show_default=False,
-        ).strip()
-        # Don't double the prefix if the user typed it (or the bare system) anyway.
-        if slug_prefix and (typed.startswith(slug_prefix) or typed in systems_values):
-            name = typed
-        else:
-            name = f"{slug_prefix}{typed}"
-        try:
+    answers: dict = {}
+
+    def _sys_values() -> list:
+        return [v.strip() for v in (answers.get("__systems") or "").split(",") if v.strip()]
+
+    def _prompt_with_prev(field: dict, prev):
+        """Prompt one model field; a blank entry keeps `prev` when there is one."""
+        if prev is not None:
+            _hint(f"  previously: {prev}   —   Enter to keep")
+            field = {**field, "required": False}
+        val = (_prompt_solution_tags(cfg, field) if field.get("name") == "solution_tags"
+               else _prompt_field_value(cfg, field))
+        if val is BACK:
+            return BACK
+        if val is None and prev is not None:
+            return prev
+        return val
+
+    def _step_systems(prev):
+        return _prompt_with_prev(systems_field, prev)
+
+    def _step_name(prev):
+        sys_vals = _sys_values()
+        prefix = f"{sys_vals[0]}-" if sys_vals else ""
+        # If systems changed on a back-step, a previous name may no longer fit.
+        if prev and prefix and not prev.startswith(prefix):
+            _hint(f"  systems changed — previous name '{prev}' no longer starts with "
+                  f"'{prefix}', please re-enter")
+            prev = None
+        while True:
+            if prev:
+                _hint(f"  previously: {prev}   —   Enter to keep")
+            typed = click.prompt(
+                click.style("Fragment name (slug, kebab-case)", fg="cyan"),
+                prompt_suffix=f": {prefix}", default="", show_default=False,
+            ).strip()
+            if _is_back(typed):
+                return BACK
             if not typed:
-                raise click.ClickException("Fragment name is required.")
-            _validate_slug_or_fail(name, field_label="Fragment name")
-            with _spinner("Checking slug availability..."):
-                _check_duplicate_slug(cfg, name, model_path, parent_path)
-            break
-        except click.ClickException as exc:
-            _failure(exc.format_message())
+                if prev:
+                    return prev
+                _failure("Fragment name is required.")
+                continue
+            # Don't double the prefix if the user typed it (or the bare system) anyway.
+            candidate = (typed if (prefix and (typed.startswith(prefix) or typed in sys_vals))
+                         else f"{prefix}{typed}")
+            try:
+                _validate_slug_or_fail(candidate, field_label="Fragment name")
+                with _spinner("Checking slug availability..."):
+                    _check_duplicate_slug(cfg, candidate, model_path, parent_path)
+                return candidate
+            except click.ClickException as exc:
+                _failure(exc.format_message())
 
-    # Title — validate based on schema rules
-    _field_heading("Fragment title", "text", title_required)
-    while True:
-        title = click.prompt(click.style("  Title", fg="cyan"), default="", show_default=False).strip()
-        if not title and title_required:
-            _failure("  Title is required for this model.")
+    def _step_title(prev):
+        _field_heading("Fragment title", "text", title_required)
+        while True:
+            if prev:
+                _hint(f"  previously: {prev}   —   Enter to keep")
+            val = click.prompt(click.style("  Title", fg="cyan"),
+                               default="", show_default=False).strip()
+            if _is_back(val):
+                return BACK
+            if not val:
+                if prev:
+                    return prev
+                if title_required:
+                    _failure("  Title is required for this model.")
+                    continue
+            return val
+
+    def _make_field_step(field_def: dict):
+        def _step(prev):
+            fname = field_def.get("name")
+            # installation UUID applies only when availability is INSTALLABLE.
+            if fname in INSTALLATION_UUID_FIELDS:
+                if (answers.get("availability") or "") != "INSTALLABLE":
+                    return SKIP
+                return _prompt_with_prev({**field_def, "required": True}, prev)
+            return _prompt_with_prev(field_def, prev)
+        return _step
+
+    steps: list = []
+    if systems_field:
+        steps.append(("__systems", _step_systems))
+    steps.append(("__name", _step_name))
+    steps.append(("__title", _step_title))
+    for f in promptable:
+        steps.append((f["name"], _make_field_step(f)))
+
+    _header("\nEnter fragment details:")
+    _back_hint()
+
+    i, direction = 0, 1
+    while i < len(steps):
+        key, step_fn = steps[i]
+        result = step_fn(answers.get(key))
+        if result is SKIP:
+            answers.pop(key, None)          # drop a now-inapplicable answer
+            i += direction
+            if i < 0:
+                i, direction = 0, 1
             continue
-        break
+        if result is BACK:
+            if i == 0:
+                _hint("  Already at the first step.")
+                direction = 1
+                continue
+            direction = -1
+            i -= 1
+            continue
+        answers[key] = result
+        direction = 1
+        i += 1
 
-    # ── field prompts ─────────────────────────────────────────────────────────
+    name  = answers.get("__name") or ""
+    title = answers.get("__title") or ""
+    systems_values = _sys_values()
+
+    # ── assemble the field payload ────────────────────────────────────────────
     fields_list: list = []
     if schema_fields:
-        # `slug` mirrors the fragment name and `systems` was already collected above —
-        # don't prompt for either again.
+        # `slug` mirrors the fragment name; `systems` was collected as its own step.
         if any(f.get("name") == "slug" for f in schema_fields):
             fields_list.append({"name": "slug", "type": "text", "values": [name]})
         if systems_values:
             sftype = systems_field.get("fieldType") or systems_field.get("type", "text")
             fields_list.append({"name": "systems", "type": sftype, "values": systems_values})
-        promptable = [
-            f for f in schema_fields
-            if f.get("name") not in ("slug", "systems")
-            and f.get("name") not in DEPRECATED_FIELDS
-        ]
-        _header(f"\nEnter values for {len(promptable)} field(s):")
-        availability = ""  # captured when the availability field is prompted (comes first)
-        for field in promptable:
-            fname = field.get("name")
-
-            # installation_asset_uuid is only valid when availability is INSTALLABLE
-            # (forbidden for IDEA / VALIDATED / BUILT_IN). Only prompt for it in that
-            # case — and make it required then — instead of asking and failing later.
-            if fname in INSTALLATION_UUID_FIELDS:
-                if availability != "INSTALLABLE":
-                    continue
-                field = {**field, "required": True}
-
-            if fname == "solution_tags":
-                value = _prompt_solution_tags(cfg, field)
-            else:
-                value = _prompt_field_value(cfg, field)
-
+        for f in promptable:
+            fname = f.get("name")
+            value = answers.get(fname)
             if value is None:
                 continue
-            ftype    = field.get("fieldType") or field.get("type", "text")
-            multiple = field.get("multiple", False)
-            # Multi-value fields come back as comma-separated string from _prompt_enum
+            ftype    = f.get("fieldType") or f.get("type", "text")
+            multiple = f.get("multiple", False)
+            # Multi-value fields come back as a comma-separated string.
             values_list = [v.strip() for v in value.split(",")] if multiple else [value]
-            if fname == "availability":
-                availability = values_list[0] if values_list else ""
             entry = {"name": fname, "type": ftype, "values": values_list}
-            # Preserve mimeType for long-text fields
-            if ftype == "long-text" and field.get("mimeType"):
-                entry["mimeType"] = field["mimeType"]
+            if ftype == "long-text" and f.get("mimeType"):
+                entry["mimeType"] = f["mimeType"]
             fields_list.append(entry)
     elif not model_id:
         click.echo("  (No schema available — fragment will be created without initial field values.)")
@@ -1360,6 +1455,8 @@ def _pick_numbered(label: str, count: int) -> int:
     """Prompt for a 1-based selection in [1, count]; returns the chosen index."""
     while True:
         raw = click.prompt(click.style(f"{label} [1-{count}]", fg="cyan"), default="1")
+        if _is_back(raw):
+            return BACK
         try:
             i = int(raw)
             if 1 <= i <= count:
@@ -1379,62 +1476,87 @@ def _interactive_select_fragment(cfg: dict) -> str:
     if not models:
         raise click.ClickException("No models found on this environment.")
 
-    _header("\nSelect model:")
-    for i, m in enumerate(models, 1):
-        name = m.get("path", "").rstrip("/").rsplit("/", 1)[-1]
-        click.echo("  " + click.style(f"{i}.", fg="cyan") + f" {m.get('title') or name}")
-    model = models[_pick_numbered("Model", len(models)) - 1]
-    model_path = model["path"]
-    folder = environments.MODEL_DEFAULTS.get(model_path) or model_path
+    # Outer loop = model choice; inner loop = filter + selection. ":back" at the
+    # selection returns to the filter, and ":back" at the filter returns to the model.
+    while True:
+        _header("\nSelect model:")
+        for i, m in enumerate(models, 1):
+            name = m.get("path", "").rstrip("/").rsplit("/", 1)[-1]
+            click.echo("  " + click.style(f"{i}.", fg="cyan") + f" {m.get('title') or name}")
+        _back_hint()
+        picked = _pick_numbered("Model", len(models))
+        if picked is BACK:
+            _hint("  Already at the first step.")
+            continue
+        model = models[picked - 1]
+        model_path = model["path"]
+        folder = environments.MODEL_DEFAULTS.get(model_path) or model_path
 
-    term = click.prompt(
-        click.style("Filter by name/slug (Enter for all)", fg="cyan"),
-        default="", show_default=False,
-    ).strip().lower()
+        chosen_id = _select_fragment_in_folder(cfg, folder)
+        if chosen_id is BACK:
+            continue          # back to model choice
+        return chosen_id
 
-    matches: list[dict] = []
 
-    # Fast path: if the filter is an exact slug, one targeted call resolves it without
-    # scanning the whole folder (the AEM search endpoint is unusable, so a partial
-    # filter still requires a full listing — but an exact slug does not).
-    if term:
-        try:
-            r = t.list_fragments(cfg, path=f"{folder}/{term}", limit=5)
-            for f in r.get("items", []):
-                if f.get("path", "").rstrip("/") == f"{folder}/{term}":
-                    matches.append({"id": f.get("id"),
-                                    "slug": term,
-                                    "title": f.get("title", "") or ""})
-        except (Exception, SystemExit):
-            pass  # fall through to the full scan
+def _select_fragment_in_folder(cfg: dict, folder: str):
+    """Filter + pick a fragment inside a folder. Returns an id, or BACK."""
+    while True:
+        term = click.prompt(
+            click.style("Filter by name/slug (Enter for all)", fg="cyan"),
+            default="", show_default=False,
+        ).strip()
+        if _is_back(term):
+            return BACK
+        term = term.lower()
 
-    # Full scan + client-side substring filter (needed for partial filters / "list all").
-    if not matches:
-        cursor = None
-        with _spinner("Loading fragments..."):
-            for _ in range(60):  # cap: 60 pages * 50
-                r = t.list_fragments(cfg, path=folder, limit=50, cursor=cursor)
+        matches: list[dict] = []
+
+        # Fast path: if the filter is an exact slug, one targeted call resolves it
+        # without scanning the whole folder (the AEM search endpoint is unusable, so a
+        # partial filter still requires a full listing — but an exact slug does not).
+        if term:
+            try:
+                r = t.list_fragments(cfg, path=f"{folder}/{term}", limit=5)
                 for f in r.get("items", []):
-                    slug = f.get("path", "").rstrip("/").rsplit("/", 1)[-1]
-                    title = f.get("title", "") or ""
-                    if not term or term in slug.lower() or term in title.lower():
-                        matches.append({"id": f.get("id"), "slug": slug, "title": title})
-                cursor = r.get("cursor")
-                if not cursor:
-                    break
+                    if f.get("path", "").rstrip("/") == f"{folder}/{term}":
+                        matches.append({"id": f.get("id"),
+                                        "slug": term,
+                                        "title": f.get("title", "") or ""})
+            except (Exception, SystemExit):
+                pass  # fall through to the full scan
 
-    if not matches:
-        where = f"matching '{term}' " if term else ""
-        raise click.ClickException(f"No fragments {where}in {folder}.")
+        # Full scan + client-side substring filter (partial filters / "list all").
+        if not matches:
+            cursor = None
+            with _spinner("Loading fragments..."):
+                for _ in range(60):  # cap: 60 pages * 50
+                    r = t.list_fragments(cfg, path=folder, limit=50, cursor=cursor)
+                    for f in r.get("items", []):
+                        slug = f.get("path", "").rstrip("/").rsplit("/", 1)[-1]
+                        title = f.get("title", "") or ""
+                        if not term or term in slug.lower() or term in title.lower():
+                            matches.append({"id": f.get("id"), "slug": slug, "title": title})
+                    cursor = r.get("cursor")
+                    if not cursor:
+                        break
 
-    matches.sort(key=lambda m: m["slug"])
-    _header(f"\n{len(matches)} match(es):")
-    for i, m in enumerate(matches, 1):
-        label = m["slug"] + (f"   ({m['title']})" if m["title"] else "")
-        click.echo("  " + click.style(f"{i}.", fg="cyan") + f" {label}")
-    chosen = matches[_pick_numbered("Select", len(matches)) - 1]
-    _success(f"Editing: {chosen['slug']}")
-    return chosen["id"]
+        if not matches:
+            where = f"matching '{term}' " if term else ""
+            _failure(f"  No fragments {where}in {folder}. Try a different filter.")
+            continue  # re-prompt the filter instead of aborting
+
+        matches.sort(key=lambda m: m["slug"])
+        _header(f"\n{len(matches)} match(es):")
+        for i, m in enumerate(matches, 1):
+            label = m["slug"] + (f"   ({m['title']})" if m["title"] else "")
+            click.echo("  " + click.style(f"{i}.", fg="cyan") + f" {label}")
+        _back_hint()
+        picked = _pick_numbered("Select", len(matches))
+        if picked is BACK:
+            continue  # back to the filter prompt
+        chosen = matches[picked - 1]
+        _success(f"Editing: {chosen['slug']}")
+        return chosen["id"]
 
 
 def _format_current_value(field: dict, values: list) -> str:
@@ -1478,11 +1600,20 @@ def _interactive_edit_fields(cfg: dict, schema_fields: list, current_values: dic
         skip = IMMUTABLE_ON_UPDATE | DEPRECATED_FIELDS | {"content_type"}
         editable = [f for f in schema_fields if f.get("name") not in skip]
     _header("\nEdit fields — press Enter to skip (keep the current value):")
-    edits = []
-    for f in editable:
+    _back_hint()
+
+    # Index cursor (not a for-loop) so ":back" can return to the previous field.
+    # `pending` holds edits made so far, keyed by field, so revisiting a field shows
+    # what you already typed and lets you clear it by pressing Enter.
+    pending: dict = {}
+    i = 0
+    while i < len(editable):
+        f = editable[i]
         name = f.get("name")
         cur_disp = _format_current_value(f, current_values.get(name, []))
         _hint(f"\n  current: {cur_disp}   —   Enter to keep")
+        if name in pending:
+            _hint(f"  pending edit: {pending[name]}   —   Enter to discard it")
         # Prompt exactly like create (numbered lists for enums, list+free-text for
         # solution_tags, file path for the guide) so the experience matches. The field
         # is treated as optional here so a blank entry keeps the current value — even
@@ -1492,12 +1623,22 @@ def _interactive_edit_fields(cfg: dict, schema_fields: list, current_values: dic
             val = _prompt_solution_tags(cfg, field_opt)
         else:
             val = _prompt_field_value(cfg, field_opt)
+
+        if val is BACK:
+            if i == 0:
+                _hint("  Already at the first field.")
+                continue
+            i -= 1
+            continue
         if val is None:
-            continue  # kept the current value
-        edits.append(f"{name}={val}")
-    if not edits:
+            pending.pop(name, None)  # blank = keep current (and drop any pending edit)
+        else:
+            pending[name] = val
+        i += 1
+
+    if not pending:
         raise click.ClickException("No changes entered — nothing to update.")
-    return tuple(edits)
+    return tuple(f"{k}={v}" for k, v in pending.items())
 
 
 @fragments.command("create")
