@@ -157,15 +157,25 @@ def _read_markdown_value(value: str) -> str:
     """
     if not _looks_like_file_path(value):
         return value
-    candidate = Path(value.strip("'\"")).expanduser()
+
+    not_found = click.ClickException(
+        f"Long-text value looks like a file path but file was not found/readable: {value}"
+    )
+
+    try:
+        # expanduser() raises RuntimeError/ValueError for a bad "~user" — e.g. "~Documents/…"
+        # is read as user 'Documents', which has no home dir. A mistyped path should be a
+        # clean "not found" error, not a crash.
+        candidate = Path(value.strip("'\"")).expanduser()
+    except (RuntimeError, ValueError):
+        raise not_found
+
     try:
         if candidate.exists() and candidate.is_file():
             return candidate.read_text(encoding="utf-8")
     except OSError:
         return value  # not a usable path (e.g. too long) — treat as inline content
-    raise click.ClickException(
-        f"Long-text value looks like a file path but file was not found/readable: {value}"
-    )
+    raise not_found  # reuse the same clear "file not found" message
 
 
 # NOTE: content_type ("connector"/"plugin") is a model-level constant — the model's
@@ -294,7 +304,13 @@ def _validate_single_value(cfg: dict, field_def: dict, value: str) -> str:
             f"Field '{name}' exceeds max length {max_len} (got {len(value)})."
         )
 
-    if regex and not re.match(regex, value):
+    if name in ANY_URL_FIELDS:
+        # Accept any valid URL, overriding the model's stricter host-whitelist regex.
+        if value and not _ANY_URL_RE.match(value):
+            raise click.ClickException(
+                f"Field '{name}' must be a valid URL (e.g. https://example.com/watch)."
+            )
+    elif regex and not re.match(regex, value):
         raise click.ClickException(f"Field '{name}': {err_msg}")
 
     if ftype == "content-reference":
@@ -317,6 +333,17 @@ DEPRECATED_FIELDS = {"redirects"}
 # Until the model rename is deployed everywhere, the CLI treats both names as the same
 # logical field (existing data / un-redeployed envs use the old name).
 INSTALLATION_UUID_FIELDS = ("installation_asset_uuid", "installation_uuid")
+
+# Fields the CLI requires at CREATE time (only if the model actually has them), beyond
+# what the model marks required. A content guide is mandatory for every new connector /
+# plugin. This is create-only — updates never force it (a fragment already has one).
+REQUIRED_ON_CREATE = {"content_guide"}
+
+# Fields that accept ANY valid URL (product decision) — the CLI overrides a stricter
+# host-whitelist regex the model may still carry until it is redeployed. `video` used to
+# be locked to specific hosts (Vimeo/YouTube/…); it can now be any valid URL.
+ANY_URL_FIELDS = {"video"}
+_ANY_URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
 
 
 # Enum fields where the CLI also accepts NEW free-text values, even though the AEM
@@ -484,11 +511,10 @@ def _normalize_and_validate_fields(
         normalized.append(entry)
 
     if require_all_required:
-        missing = [
-            f.get("name")
-            for f in schema_fields
-            if f.get("required") and not by_name.get(f.get("name", ""))
-        ]
+        required_names = {f.get("name") for f in schema_fields if f.get("required")}
+        # Fields the CLI additionally requires on create (only those the model actually has).
+        required_names |= {n for n in REQUIRED_ON_CREATE if n in schema}
+        missing = [n for n in required_names if not by_name.get(n)]
         if missing:
             raise click.ClickException(
                 f"Missing required field(s): {', '.join(sorted(missing))}."
@@ -498,10 +524,10 @@ def _normalize_and_validate_fields(
     return normalized
 
 
-# Fields that must never be changed once a fragment exists. `slug`/`systems` are
-# identity; `availability` is fixed at creation (a plugin's VALIDATED/INSTALLABLE state
-# doesn't change via guide updates).
-IMMUTABLE_ON_UPDATE = {"slug", "systems", "availability"}
+# Fields that must never be changed once a fragment exists — identity fields. Availability
+# IS editable on update (a plugin can move e.g. IDEA -> INSTALLABLE); the availability↔UUID
+# interdependency is handled in the edit loop and the cross-field rules.
+IMMUTABLE_ON_UPDATE = {"slug", "systems"}
 
 # Fields a user may edit on update, per the marketplace guide journeys (keyed by model
 # name). Anything not listed is locked on update — the interactive loop won't offer it
@@ -510,10 +536,10 @@ IMMUTABLE_ON_UPDATE = {"slug", "systems", "availability"}
 EDITABLE_ON_UPDATE = {
     "marketplace-plugin": {
         "marketplace_name", "description", "purple_chat_link",
-        "solution_tags", "content_guide",
+        "solution_tags", "content_guide", "availability",
         *INSTALLATION_UUID_FIELDS,  # both names during the rename transition
     },
-    "marketplace-connector": {"logo", "content_guide"},
+    "marketplace-connector": {"description", "logo", "content_guide"},
 }
 
 
@@ -533,6 +559,25 @@ def _validate_slug_or_fail(slug: str, *, field_label: str = "slug"):
 
 def _folder_for_model(model_path: str, search_folder: str = "") -> str:
     return search_folder.rstrip("/") or environments.MODEL_DEFAULTS.get(model_path, "")
+
+
+def _fragment_json_url(cfg: dict, fragment_id: str) -> str:
+    """The CF Sites API URL that returns this fragment's JSON.
+
+    Requires the OAuth bearer token (not browser-clickable) — it's the same endpoint
+    the CLI calls, handy as a curl target or for reference.
+    """
+    base = (cfg.get("ADOBE_SITES_API_BASE_URL") or "").rstrip("/")
+    return f"{base}/cf/fragments/{fragment_id}" if base and fragment_id else ""
+
+
+def _emit_fragment_json_url(cfg: dict, fragment_id: str) -> None:
+    """Print the fragment's JSON URL (+ a note that it needs the token)."""
+    url = _fragment_json_url(cfg, fragment_id)
+    if not url:
+        return
+    click.echo(click.style("JSON:    ", fg="green", bold=True) + url)
+    _hint(f"  (needs your token — or run: cf-agent fragments get {fragment_id} --json)")
 
 
 def _check_duplicate_slug(
@@ -569,6 +614,41 @@ def _check_duplicate_slug(
                 f"Slug '{slug}' is already in use by an existing fragment: {frag_path}\n"
                 "Choose a unique slug."
             )
+
+
+def _check_logo_unique(cfg: dict, logo_path: str, folder: str, *, exclude_id: str = "") -> None:
+    """Raise if another fragment in `folder` already uses this logo (one-to-one mapping).
+
+    Scans the folder once and compares each fragment's `logo` value to `logo_path`. Only
+    applies where a logo field exists (connectors). Best-effort: a scan failure fails open
+    so it never blocks a write on a transient error.
+    """
+    logo_path = (logo_path or "").rstrip("/")
+    if not logo_path or not folder:
+        return
+
+    cursor = None
+    try:
+        for _ in range(60):  # cap: 60 pages * 50
+            r = t.list_fragments(cfg, path=folder, limit=50, cursor=cursor)
+            for f in r.get("items", []):
+                if exclude_id and f.get("id") == exclude_id:
+                    continue
+                logo_field = next((x for x in f.get("fields", []) if x.get("name") == "logo"), None)
+                values = [str(v).rstrip("/") for v in (logo_field.get("values") if logo_field else []) or []]
+                if logo_path in values:
+                    other = f.get("path", "").rstrip("/").rsplit("/", 1)[-1]
+                    raise click.ClickException(
+                        f"Logo '{logo_path}' is already used by '{other}'.\n"
+                        "Each connector needs a unique logo (one-to-one) — choose a different file."
+                    )
+            cursor = r.get("cursor")
+            if not cursor:
+                break
+    except click.ClickException:
+        raise                       # the uniqueness violation — propagate
+    except (Exception, SystemExit):
+        return                      # scan failure — fail open, don't block the write
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -1342,6 +1422,9 @@ def _interactive_create(cfg) -> dict:
                 if (answers.get("availability") or "") != "INSTALLABLE":
                     return SKIP
                 return _prompt_with_prev({**field_def, "required": True}, prev)
+            # content_guide is mandatory on create — prompt as required, re-prompt on blank.
+            if fname in REQUIRED_ON_CREATE:
+                return _prompt_with_prev({**field_def, "required": True}, prev)
             return _prompt_with_prev(field_def, prev)
         return _step
 
@@ -1498,65 +1581,97 @@ def _interactive_select_fragment(cfg: dict) -> str:
         return chosen_id
 
 
+_PICKER_PAGE = 20  # entries shown per page in the fragment picker
+
+
+def _matching_fragments(cfg: dict, folder: str, term: str) -> list[dict]:
+    """Return [{id, slug, title}] in a folder whose slug/title STARTS WITH `term`.
+
+    Prefix match (not substring) so 'work' surfaces workday-… plugins rather than every
+    slug that merely contains 'work'. An exact-slug filter takes a single targeted call
+    and returns just that one; otherwise the folder is scanned (the AEM search endpoint
+    is unusable). `term` must already be lowercased.
+    """
+    if term:
+        try:  # exact-slug fast path — one call, no scan
+            r = t.list_fragments(cfg, path=f"{folder}/{term}", limit=5)
+            for f in r.get("items", []):
+                if f.get("path", "").rstrip("/") == f"{folder}/{term}":
+                    return [{"id": f.get("id"), "slug": term, "title": f.get("title", "") or ""}]
+        except (Exception, SystemExit):
+            pass
+
+    matches: list[dict] = []
+    cursor = None
+    with _spinner("Loading fragments..."):
+        for _ in range(60):  # cap: 60 pages * 50
+            r = t.list_fragments(cfg, path=folder, limit=50, cursor=cursor)
+            for f in r.get("items", []):
+                slug = f.get("path", "").rstrip("/").rsplit("/", 1)[-1]
+                title = f.get("title", "") or ""
+                if not term or slug.lower().startswith(term) or title.lower().startswith(term):
+                    matches.append({"id": f.get("id"), "slug": slug, "title": title})
+            cursor = r.get("cursor")
+            if not cursor:
+                break
+    matches.sort(key=lambda m: m["slug"])  # alphabetical
+    return matches
+
+
 def _select_fragment_in_folder(cfg: dict, folder: str):
-    """Filter + pick a fragment inside a folder. Returns an id, or BACK."""
-    while True:
+    """Filter (prefix) + pick a fragment inside a folder, paginated. Returns an id or BACK."""
+    while True:  # filter loop
         term = click.prompt(
             click.style("Filter by name/slug (Enter for all)", fg="cyan"),
             default="", show_default=False,
         ).strip()
         if _is_back(term):
             return BACK
-        term = term.lower()
 
-        matches: list[dict] = []
-
-        # Fast path: if the filter is an exact slug, one targeted call resolves it
-        # without scanning the whole folder (the AEM search endpoint is unusable, so a
-        # partial filter still requires a full listing — but an exact slug does not).
+        matches = _matching_fragments(cfg, folder, term.lower())
+        if not matches:
+            where = f"starting with '{term}' " if term else ""
+            _failure(f"  No entries {where}here. Try a different filter (Enter lists all).")
+            continue
         if term:
-            try:
-                r = t.list_fragments(cfg, path=f"{folder}/{term}", limit=5)
-                for f in r.get("items", []):
-                    if f.get("path", "").rstrip("/") == f"{folder}/{term}":
-                        matches.append({"id": f.get("id"),
-                                        "slug": term,
-                                        "title": f.get("title", "") or ""})
-            except (Exception, SystemExit):
-                pass  # fall through to the full scan
+            _hint("  Tip: slugs start with the connector/system name — e.g. type 'workday'.")
 
-        # Full scan + client-side substring filter (partial filters / "list all").
-        if not matches:
-            cursor = None
-            with _spinner("Loading fragments..."):
-                for _ in range(60):  # cap: 60 pages * 50
-                    r = t.list_fragments(cfg, path=folder, limit=50, cursor=cursor)
-                    for f in r.get("items", []):
-                        slug = f.get("path", "").rstrip("/").rsplit("/", 1)[-1]
-                        title = f.get("title", "") or ""
-                        if not term or term in slug.lower() or term in title.lower():
-                            matches.append({"id": f.get("id"), "slug": slug, "title": title})
-                    cursor = r.get("cursor")
-                    if not cursor:
-                        break
-
-        if not matches:
-            where = f"matching '{term}' " if term else ""
-            _failure(f"  No fragments {where}in {folder}. Try a different filter.")
-            continue  # re-prompt the filter instead of aborting
-
-        matches.sort(key=lambda m: m["slug"])
-        _header(f"\n{len(matches)} match(es):")
-        for i, m in enumerate(matches, 1):
-            label = m["slug"] + (f"   ({m['title']})" if m["title"] else "")
-            click.echo("  " + click.style(f"{i}.", fg="cyan") + f" {label}")
-        _back_hint()
-        picked = _pick_numbered("Select", len(matches))
-        if picked is BACK:
-            continue  # back to the filter prompt
-        chosen = matches[picked - 1]
-        _success(f"Editing: {chosen['slug']}")
-        return chosen["id"]
+        pages = (len(matches) + _PICKER_PAGE - 1) // _PICKER_PAGE
+        page = 0
+        back_to_filter = False
+        while True:  # pagination + selection loop
+            start = page * _PICKER_PAGE
+            chunk = matches[start:start + _PICKER_PAGE]
+            hdr = f"\n{len(matches)} match(es)" + (f"  —  page {page + 1}/{pages}" if pages > 1 else "") + ":"
+            _header(hdr)
+            for i, m in enumerate(chunk, start + 1):
+                label = m["slug"] + (f"   ({m['title']})" if m["title"] else "")
+                click.echo("  " + click.style(f"{i:>3}.", fg="cyan") + f" {label}")
+            nav = []
+            if page + 1 < pages:
+                nav.append("n=next")
+            if page > 0:
+                nav.append("p=prev")
+            hint = f"Select 1-{len(matches)}" + (f" ({', '.join(nav)})" if nav else "") + " or :back"
+            raw = click.prompt(click.style(hint, fg="cyan"), default="", show_default=False).strip()
+            low = raw.lower()
+            if _is_back(raw):
+                back_to_filter = True
+                break
+            if low in ("n", "next") and page + 1 < pages:
+                page += 1
+                continue
+            if low in ("p", "prev") and page > 0:
+                page -= 1
+                continue
+            if raw.isdigit() and 1 <= int(raw) <= len(matches):
+                chosen = matches[int(raw) - 1]
+                _success(f"Editing: {chosen['slug']}")
+                return chosen["id"]
+            _failure(f"  Enter a number 1-{len(matches)}"
+                     + (", n/p to page," if pages > 1 else "") + " or :back.")
+        if back_to_filter:
+            continue  # re-prompt the filter
 
 
 def _format_current_value(field: dict, values: list) -> str:
@@ -1602,23 +1717,49 @@ def _interactive_edit_fields(cfg: dict, schema_fields: list, current_values: dic
     _header("\nEdit fields — press Enter to skip (keep the current value):")
     _back_hint()
 
+    def _eff_availability() -> str:
+        """The availability that will apply after this edit — a pending change wins."""
+        if "availability" in pending:
+            return pending["availability"]
+        return (current_values.get("availability") or [""])[0]
+
+    def _has_current_uuid() -> bool:
+        return any(current_values.get(u) not in (None, [], [""]) for u in INSTALLATION_UUID_FIELDS)
+
     # Index cursor (not a for-loop) so ":back" can return to the previous field.
     # `pending` holds edits made so far, keyed by field, so revisiting a field shows
     # what you already typed and lets you clear it by pressing Enter.
     pending: dict = {}
-    i = 0
+    i, direction = 0, 1
     while i < len(editable):
         f = editable[i]
         name = f.get("name")
+
+        # Availability↔UUID interdependency: the installation UUID applies ONLY when
+        # availability is INSTALLABLE. Otherwise skip it — and if the fragment currently
+        # carries a UUID, drop it (a downgrade to VALIDATED/IDEA must clear the asset).
+        if name in INSTALLATION_UUID_FIELDS:
+            if _eff_availability() != "INSTALLABLE":
+                pending[name] = "" if _has_current_uuid() else pending.get(name, None)
+                if pending.get(name) is None:
+                    pending.pop(name, None)
+                i += direction
+                if i < 0:
+                    i, direction = 0, 1
+                continue
+
         cur_disp = _format_current_value(f, current_values.get(name, []))
         _hint(f"\n  current: {cur_disp}   —   Enter to keep")
         if name in pending:
             _hint(f"  pending edit: {pending[name]}   —   Enter to discard it")
-        # Prompt exactly like create (numbered lists for enums, list+free-text for
-        # solution_tags, file path for the guide) so the experience matches. The field
-        # is treated as optional here so a blank entry keeps the current value — even
-        # for required fields. Each value is validated inline by these prompts.
-        field_opt = {**f, "required": False}
+
+        # Prompt exactly like create (numbered enums, solution_tags list+free-text, guide
+        # file path). Fields are optional here so a blank entry keeps the current value —
+        # EXCEPT a newly-INSTALLABLE plugin with no UUID yet, which must supply one.
+        required = False
+        if name in INSTALLATION_UUID_FIELDS and _eff_availability() == "INSTALLABLE":
+            required = not (_has_current_uuid() or name in pending)
+        field_opt = {**f, "required": required}
         if name == "solution_tags":
             val = _prompt_solution_tags(cfg, field_opt)
         else:
@@ -1627,13 +1768,16 @@ def _interactive_edit_fields(cfg: dict, schema_fields: list, current_values: dic
         if val is BACK:
             if i == 0:
                 _hint("  Already at the first field.")
+                direction = 1
                 continue
+            direction = -1
             i -= 1
             continue
         if val is None:
             pending.pop(name, None)  # blank = keep current (and drop any pending edit)
         else:
             pending[name] = val
+        direction = 1
         i += 1
 
     if not pending:
@@ -1729,6 +1873,12 @@ def create_fragment(interactive, parent_path, model_path, name, field_args, fiel
                 params.get("parentPath", ""),
             )
 
+    # One-to-one logo guard (connectors): reject a logo already used by another connector.
+    logo_entry = next((f for f in (params.get("fields") or []) if f.get("name") == "logo"), None)
+    if logo_entry and logo_entry.get("values"):
+        with _spinner("Checking logo is unique..."):
+            _check_logo_unique(cfg, logo_entry["values"][0], params.get("parentPath", ""))
+
     with _spinner("Creating fragment in AEM..."):
         data = t.create_fragment(cfg, **params)
     if as_json:
@@ -1736,6 +1886,7 @@ def create_fragment(interactive, parent_path, model_path, name, field_args, fiel
         return
     _success(f"\nCreated: {data.get('id')}")
     click.echo(click.style("Path:    ", fg="green", bold=True) + f"{data.get('path')}")
+    _emit_fragment_json_url(cfg, data.get("id"))
 
 
 @fragments.command("update")
@@ -1820,17 +1971,16 @@ def update_fragment(id, interactive, slug, model_path_opt, title, field_args, pa
             model_path,
             require_all_required=False,
         )
+        frag_parent = "/".join(fragment.get("path", "").rstrip("/").split("/")[:-1])
         # Duplicate-slug guard: only fires when the slug field is being changed.
         for entry in normalized_fields:
             if entry["name"] == "slug" and entry.get("values"):
-                frag_parent = "/".join(fragment.get("path", "").rstrip("/").split("/")[:-1])
-                _check_duplicate_slug(
-                    cfg,
-                    entry["values"][0],
-                    model_path,
-                    frag_parent,
-                    exclude_fragment_id=id,
-                )
+                _check_duplicate_slug(cfg, entry["values"][0], model_path, frag_parent,
+                                      exclude_fragment_id=id)
+            # One-to-one logo guard: only fires when the logo is being changed (exclude self).
+            if entry["name"] == "logo" and entry.get("values"):
+                with _spinner("Checking logo is unique..."):
+                    _check_logo_unique(cfg, entry["values"][0], frag_parent, exclude_id=id)
         for entry in normalized_fields:
             name = entry["name"]
             if name in IMMUTABLE_ON_UPDATE:
@@ -1951,6 +2101,7 @@ def update_fragment(id, interactive, slug, model_path_opt, title, field_args, pa
         _print_json(data)
         return
     click.echo(f"Updated: {data.get('id')}  {data.get('path')}")
+    _emit_fragment_json_url(cfg, data.get("id"))
 
 
 @fragments.command("validate")
