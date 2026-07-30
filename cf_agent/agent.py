@@ -1263,6 +1263,16 @@ def _prompt_field_value(cfg: dict, field: dict) -> str | None:
             if not _asset_exists(cfg, value):
                 _failure(f"  Asset not found in AEM: {value}. Please enter a valid asset name.")
                 continue
+            # Inline one-to-one logo check: re-prompt here rather than failing at the end.
+            uniq_folder = field.get("_uniqueness_folder")
+            if uniq_folder:
+                try:
+                    with _spinner("Checking logo is unique..."):
+                        _check_logo_unique(cfg, value, uniq_folder,
+                                           exclude_id=field.get("_uniqueness_exclude_id", ""))
+                except click.ClickException as exc:
+                    _failure(f"  {exc.format_message()}")
+                    continue
 
         return value
 
@@ -1425,6 +1435,9 @@ def _interactive_create(cfg) -> dict:
             # content_guide is mandatory on create — prompt as required, re-prompt on blank.
             if fname in REQUIRED_ON_CREATE:
                 return _prompt_with_prev({**field_def, "required": True}, prev)
+            # logo: validate one-to-one uniqueness inline (before the next step).
+            if fname == "logo":
+                return _prompt_with_prev({**field_def, "_uniqueness_folder": parent_path}, prev)
             return _prompt_with_prev(field_def, prev)
         return _step
 
@@ -1700,7 +1713,8 @@ def _is_review_locked(fragment: dict) -> bool:
     return False
 
 
-def _interactive_edit_fields(cfg: dict, schema_fields: list, current_values: dict, allowed: set | None) -> tuple:
+def _interactive_edit_fields(cfg: dict, schema_fields: list, current_values: dict, allowed: set | None,
+                             folder: str = "", exclude_id: str = "") -> tuple:
     """Prompt each editable field showing its current value (Enter keeps it).
 
     Each entered value is validated inline (asset existence, regex, maxLength, enum,
@@ -1760,6 +1774,10 @@ def _interactive_edit_fields(cfg: dict, schema_fields: list, current_values: dic
         if name in INSTALLATION_UUID_FIELDS and _eff_availability() == "INSTALLABLE":
             required = not (_has_current_uuid() or name in pending)
         field_opt = {**f, "required": required}
+        if name == "logo" and folder:
+            # validate one-to-one logo uniqueness inline (exclude this fragment itself)
+            field_opt["_uniqueness_folder"] = folder
+            field_opt["_uniqueness_exclude_id"] = exclude_id
         if name == "solution_tags":
             val = _prompt_solution_tags(cfg, field_opt)
         else:
@@ -1959,7 +1977,9 @@ def update_fragment(id, interactive, slug, model_path_opt, title, field_args, pa
 
     # -i with no explicit -f/--title/--patch → prompt the editable fields inline.
     if interactive and not field_args and not title and not patch:
-        field_args = _interactive_edit_fields(cfg, schema_fields, effective_values, editable)
+        frag_folder = "/".join(fragment.get("path", "").rstrip("/").split("/")[:-1])
+        field_args = _interactive_edit_fields(cfg, schema_fields, effective_values, editable,
+                                              folder=frag_folder, exclude_id=id)
 
     if title:
         patch_ops.append({"op": "replace", "path": "/title", "value": title})
