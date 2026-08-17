@@ -17,18 +17,20 @@ The whole S3 dependency is contained in this module. If/when an in-AEM upload
 broker exists, only ``stage_and_import`` needs to change — the ``asset upload``
 command and its output contract stay the same.
 
-Non-secret staging settings may be set as a shell environment variable *or* as
-a ``KEY=VALUE`` line in ``~/.cf-agent/config`` (env var wins):
+The staging bucket, region and prefix are fixed infrastructure and ship with the
+app, so a new user configures nothing to upload. Each can still be overridden as
+a shell environment variable *or* a ``KEY=VALUE`` line in ``~/.cf-agent/config``
+(env var wins) when pointing at another environment:
 
-    AWS_S3_STAGING_BUCKET    (required) — bucket the CLI may write to
+    AWS_S3_STAGING_BUCKET    (default: the built-in staging bucket)
     AWS_S3_STAGING_REGION    (default: us-west-2)
     AWS_S3_STAGING_PREFIX    (default: aem-assets/) — key prefix; must stay
                              inside aem-assets/ or cleanup cannot delete
 
 The AWS key/secret are *credentials*, so they are sourced separately and never
 from the plaintext config file (see ``_resolve_credentials``): shell env vars
-first, then boto3's own chain (a shared ``~/.aws`` profile, SSO, or an instance
-role).
+first, then the OS keychain set via ``cf-agent asset credentials set``, then
+boto3's own chain (a shared ``~/.aws`` profile, SSO, or an instance role).
 """
 
 import mimetypes
@@ -41,7 +43,7 @@ from pathlib import Path
 import click
 import httpx
 
-from . import auth, client
+from . import auth, client, secretstore
 
 # How long the pre-signed GET URL stays valid — long enough for AEM to pull a
 # large file, short enough that a URL leaked from a log goes stale quickly. It
@@ -54,6 +56,10 @@ _PRESIGN_TTL_SECONDS = 900
 _POLL_TRIES = 30
 _POLL_INTERVAL_SECONDS = 2
 
+# The staging bucket is fixed infrastructure, not a per-user setting — it is not
+# secret, so it ships with the app and nobody has to configure anything to upload.
+# AWS_S3_STAGING_BUCKET still overrides it, for pointing at another environment.
+_DEFAULT_BUCKET = "mw-am-usw2-dev-aem-nightfall-audit-logs"
 _DEFAULT_REGION = "us-west-2"
 
 # Must stay inside the prefix the IAM policy allows s3:DeleteObject on, or the
@@ -69,13 +75,9 @@ def _setting(cfg: dict, key: str, default: str = None) -> str:
 
 
 def _staging_config(cfg: dict) -> dict:
-    bucket = _setting(cfg, "AWS_S3_STAGING_BUCKET")
-    if not bucket:
-        raise click.ClickException(
-            "Asset upload needs an S3 staging bucket.\n"
-            "Set AWS_S3_STAGING_BUCKET (and AWS credentials) in your environment "
-            "or in ~/.cf-agent/config. See `cf-agent asset upload --help`."
-        )
+    # _setting treats an empty override as unset, so this always resolves to a
+    # non-empty bucket — there is no "not configured" failure mode any more.
+    bucket = _setting(cfg, "AWS_S3_STAGING_BUCKET", _DEFAULT_BUCKET)
 
     prefix = _setting(cfg, "AWS_S3_STAGING_PREFIX", _DEFAULT_PREFIX)
     if prefix and not prefix.endswith("/"):
@@ -93,7 +95,8 @@ def _resolve_credentials() -> dict:
 
     1. Shell environment variables (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY /
        AWS_SESSION_TOKEN) — handy for CI/automation.
-    2. Nothing → empty, so boto3 falls back to its own chain (a shared ~/.aws
+    2. The OS keychain, set via ``cf-agent asset credentials set`` (encrypted).
+    3. Neither → empty, so boto3 falls back to its own chain (a shared ~/.aws
        profile, SSO, or an instance role).
 
     Secrets are never read from the plaintext ~/.cf-agent/config file.
@@ -109,6 +112,17 @@ def _resolve_credentials() -> dict:
         if session_token:
             creds["aws_session_token"] = session_token
         return creds
+
+    stored = secretstore.get_aws_credentials()
+    if stored:
+        creds = {
+            "aws_access_key_id": stored["access_key_id"],
+            "aws_secret_access_key": stored["secret_access_key"],
+        }
+        if stored.get("session_token"):
+            creds["aws_session_token"] = stored["session_token"]
+        return creds
+
     return {}
 
 
