@@ -43,8 +43,10 @@ def _load_keyring(required: bool = True):
     except ImportError:
         if required:
             raise click.ClickException(
-                "Storing credentials securely requires the 'keyring' package.\n"
-                "Install it with:  pip install keyring"
+                "Storing credentials securely requires 'keyring', which ships with "
+                "cf-agent. Your install looks incomplete — reinstall with:\n"
+                "    pip install --upgrade --force-reinstall cf-agent\n"
+                "(or install the one package: pip install keyring)"
             )
         return None
     return keyring

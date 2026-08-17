@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cf-agent"
-version = "1.0.0"
+version = "1.1.0"
 description = "CLI for managing AEM Content Fragments — Moveworks Marketplace"
 requires-python = ">=3.10"
 dependencies = [
@@ -13,12 +13,20 @@ dependencies = [
     # macOS ships libedit under the `readline` name, which mishandles up/down arrow
     # history in interactive prompts. gnureadline is a GNU-readline drop-in that fixes it.
     "gnureadline>=8.0.0; sys_platform == 'darwin'",
+    # `asset upload` stages the file to S3 so AEM can pull it from a pre-signed URL,
+    # and stores the AWS credentials in the OS keychain. These were once an optional
+    # `[upload]` extra, but that just meant every user hit a missing-package error the
+    # first time they ran the command — `pip install cf-agent` now covers everything.
+    # keyring pulls its own platform backend (pywin32-ctypes on Windows,
+    # SecretStorage/jeepney on Linux); macOS Keychain needs nothing extra.
+    "boto3>=1.34.0",
+    "keyring>=24.0.0",
 ]
 
 [project.optional-dependencies]
-# Needed only for `cf-agent asset upload`, which stages the local file to S3
-# so AEM can pull it from a pre-signed URL.
-upload = ["boto3>=1.34.0", "keyring>=24.0.0"]
+# Retained so an existing `pip install 'cf-agent[upload]'` keeps working; the
+# packages it used to pull are part of the base install now.
+upload = []
 
 [project.scripts]
 cf-agent = "cf_agent.agent:cli"

@@ -132,8 +132,10 @@ def _s3_client(stg: dict):
         from botocore.config import Config
     except ImportError:
         raise click.ClickException(
-            "Asset upload requires boto3. Install it with:\n"
-            "    pip install 'cf-agent[upload]'   (or: pip install boto3)"
+            "Asset upload requires boto3, which ships with cf-agent. Your install "
+            "looks incomplete — reinstall with:\n"
+            "    pip install --upgrade --force-reinstall cf-agent\n"
+            "(or install the one package: pip install boto3)"
         )
 
     # Virtual-host addressing + SigV4 pinned to the bucket's own region. Without
