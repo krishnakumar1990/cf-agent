@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cf-agent"
-version = "1.0.0"
+version = "1.1.0"
 description = "CLI for managing AEM Content Fragments — Moveworks Marketplace"
 requires-python = ">=3.10"
 dependencies = [
