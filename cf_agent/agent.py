@@ -850,7 +850,64 @@ def _effective_content_root(field: dict) -> str:
 
 @cli.group()
 def asset():
-    """Check assets in the AEM DAM."""
+    """Check and upload assets in the AEM DAM."""
+
+
+@asset.command("upload")
+@click.argument("local_file", type=click.Path(exists=True, dir_okay=False))
+@click.option("--logo", is_flag=True, help=f"Upload into the marketplace logos folder ({LOGO_ROOT}).")
+@click.option("--image", is_flag=True, help=f"Upload into the marketplace images folder ({IMAGE_ROOT}).")
+@click.option("--root", default=None, metavar="DAM_PATH", help="Destination DAM folder (e.g. /content/dam/marketplace/screenshots).")
+@click.option("--name", "dest_name", default=None, help="File name to use in the DAM (defaults to the local file name).")
+@click.option("--json", "as_json", is_flag=True, help="Output raw JSON")
+def asset_upload(local_file, logo, image, root, dest_name, as_json):
+    """Upload a local file into the AEM DAM via an S3 staging hop.
+
+    The file is uploaded to the S3 staging bucket, a short-lived pre-signed GET
+    URL is generated, and AEM is asked to pull the asset from that URL.
+
+    The staged S3 object is deleted once the import finishes.
+
+    Staging settings (env var or ~/.cf-agent/config):
+
+      AWS_S3_STAGING_BUCKET   (required)
+      AWS_S3_STAGING_REGION   (default: us-west-2)
+      AWS_S3_STAGING_PREFIX   (default: aem-assets/ — the only prefix the CLI's
+                              IAM user may delete from; changing it means staged
+                              objects are never cleaned up)
+
+    AWS credentials come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY, or
+    boto3's own chain (~/.aws profile, SSO, instance role).
+    """
+    from . import uploader
+
+    if sum(bool(x) for x in (logo, image, root)) > 1:
+        raise click.ClickException("Use only one of --logo, --image, or --root.")
+
+    if root:
+        dam_folder = root.rstrip("/")
+    elif logo:
+        dam_folder = LOGO_ROOT
+    elif image:
+        dam_folder = IMAGE_ROOT
+    else:
+        raise click.ClickException(
+            "Choose a destination folder with --logo, --image, or --root."
+        )
+
+    cfg = _cfg()
+    on_status = None if as_json else lambda m: _hint(f"  {m}")
+
+    result = uploader.stage_and_import(
+        cfg, local_file, dam_folder, dest_name, on_status=on_status
+    )
+
+    if as_json:
+        _print_json(result)
+    else:
+        _success(f"✓ Uploaded: {result['dam_path']}")
+        if result.get("asset_id"):
+            _hint(f"  assetId: {result['asset_id']}")
 
 
 @asset.command("exists")
