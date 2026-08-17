@@ -70,7 +70,15 @@ def load_config() -> dict:
 
 
 def save_config(values: dict) -> None:
-    _write_file(CONFIG_FILE, values)
+    """Merge ``values`` into the config file, preserving keys not passed in.
+
+    `login` rewrites only the ADOBE_* keys, so a plain overwrite would silently
+    drop unrelated settings the user has added (AWS_S3_STAGING_BUCKET and
+    friends) every time they re-authenticate.
+    """
+    merged = _parse_file(CONFIG_FILE)
+    merged.update(values)
+    _write_file(CONFIG_FILE, merged)
 
 
 def load_tokens() -> dict:

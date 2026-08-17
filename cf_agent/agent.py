@@ -868,16 +868,13 @@ def asset_upload(local_file, logo, image, root, dest_name, as_json):
 
     The staged S3 object is deleted once the import finishes.
 
-    Staging settings (env var or ~/.cf-agent/config):
+    The staging bucket, region and prefix ship with the app — there is nothing to
+    configure. Set AWS_S3_STAGING_BUCKET / _REGION / _PREFIX (env var or
+    ~/.cf-agent/config) only to point at a different environment. The prefix must
+    stay inside aem-assets/, the only prefix the CLI's IAM user may delete from.
 
-      AWS_S3_STAGING_BUCKET   (required)
-      AWS_S3_STAGING_REGION   (default: us-west-2)
-      AWS_S3_STAGING_PREFIX   (default: aem-assets/ — the only prefix the CLI's
-                              IAM user may delete from; changing it means staged
-                              objects are never cleaned up)
-
-    AWS credentials come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY, or
-    boto3's own chain (~/.aws profile, SSO, instance role).
+    AWS credentials come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY, the OS
+    keychain (`cf-agent asset credentials set`), or boto3's own chain.
     """
     from . import uploader
 
@@ -908,6 +905,73 @@ def asset_upload(local_file, logo, image, root, dest_name, as_json):
         _success(f"✓ Uploaded: {result['dam_path']}")
         if result.get("asset_id"):
             _hint(f"  assetId: {result['asset_id']}")
+
+
+@asset.group("credentials")
+def asset_credentials():
+    """Manage the AWS credentials used for asset upload staging."""
+
+
+@asset_credentials.command("set")
+@click.option("--access-key-id", default=None, help="AWS access key ID (prompted if omitted).")
+@click.option("--secret-access-key", default=None, help="AWS secret access key (prompted if omitted).")
+@click.option("--session-token", default=None, help="AWS session token, for temporary credentials.")
+def asset_credentials_set(access_key_id, secret_access_key, session_token):
+    """Store AWS credentials in the OS keychain (encrypted at rest).
+
+    Values are kept in the macOS Keychain / Windows Credential Manager / Linux
+    Secret Service — never in a plaintext file and never in the repo. Omit the
+    options to be prompted; the secret is hidden as you paste it, so it does not
+    land in your shell history.
+    """
+    from . import secretstore
+
+    access_key_id = access_key_id or click.prompt("AWS Access Key ID")
+    secret_access_key = secret_access_key or click.prompt(
+        "AWS Secret Access Key", hide_input=True
+    )
+
+    secretstore.set_aws_credentials(
+        access_key_id.strip(), secret_access_key.strip(),
+        (session_token or "").strip() or None,
+    )
+    _success("AWS credentials stored in the OS keychain.")
+    _hint("  They are used automatically by `cf-agent asset upload`.")
+
+
+@asset_credentials.command("show")
+def asset_credentials_show():
+    """Show whether credentials are stored, without revealing the secret."""
+    from . import secretstore
+
+    backend = secretstore.backend_name() or "none available"
+
+    stored = secretstore.get_aws_credentials()
+    if not stored:
+        _failure("No AWS credentials stored in the OS keychain.")
+        _hint(f"  Keychain backend : {backend}")
+        _hint("  Set them with: cf-agent asset credentials set")
+        return
+
+    akid = stored["access_key_id"]
+    masked = f"{akid[:4]}...{akid[-4:]}" if len(akid) > 8 else "(set)"
+    _success("AWS credentials are stored in the OS keychain.")
+    click.echo(f"  Keychain backend : {backend}")
+    click.echo(f"  Access Key ID    : {masked}")
+    click.echo(f"  Secret Access Key: (hidden)")
+    if stored.get("session_token"):
+        click.echo(f"  Session Token    : (set)")
+
+
+@asset_credentials.command("clear")
+def asset_credentials_clear():
+    """Remove the stored AWS credentials from the OS keychain."""
+    from . import secretstore
+
+    if secretstore.clear_aws_credentials():
+        _success("AWS credentials removed from the OS keychain.")
+    else:
+        _hint("No AWS credentials were stored.")
 
 
 @asset.command("exists")
