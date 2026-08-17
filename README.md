@@ -13,6 +13,7 @@ Create, edit, publish, and inspect fragments across **PROD / STAGE / DEV** with 
 - **Edit without a UUID** — find and select a fragment by model + name filter, or by slug.
 - **Live validation** against the model: required fields, enums, max-length, regex, kebab-case slugs, duplicate-slug detection, and cross-field rules.
 - **Content guides from markdown files**, with automatic checking that every referenced AEM image exists.
+- **Upload assets straight from your machine** (`asset upload`) — logos and content-guide images go into the DAM without opening AEM.
 - **Smart defaults** — logo/asset folders auto-prefixed, plugin slugs seeded with the system name, model folders chosen automatically.
 - **Guardrails** — immutable fields and review-locked fragments are caught up front, not after you fill in a form.
 - **Command history** — ↑/↓ recall previous entries in interactive prompts.
@@ -30,6 +31,7 @@ Create, edit, publish, and inspect fragments across **PROD / STAGE / DEV** with 
 - [Content guides & images](#content-guides--images)
 - [Other fragment commands](#other-fragment-commands)
 - [Models & assets](#models--assets)
+- [Uploading assets](#uploading-assets)
 - [Troubleshooting / Debug](#troubleshooting--debug)
 
 ---
@@ -234,7 +236,7 @@ Only these fields can be changed on update — everything else is locked.
 
 When you provide the file, the CLI reads it and **verifies every AEM image it references exists**. It checks `/content/dam/...` paths in markdown images `![](…)`, links `[](…)`, and HTML `<img src="…">` (full AEM URLs too). If any referenced image is missing, the operation is blocked and the missing paths are listed.
 
-**Workflow for images:** upload the image to AEM first (e.g. under the fragment's folder), reference it by its `/content/dam/...` path in the markdown, then create/update the guide. Relative image paths from a raw export (e.g. `![](image.png)`) are **not** uploaded — reference images by their DAM path.
+**Workflow for images:** upload the image to AEM first — `cf-agent asset upload ./shot.png --image` (see [Uploading assets](#uploading-assets)) or by hand in AEM — reference it by the `/content/dam/...` path it returns, then create/update the guide. Relative image paths from a raw export (e.g. `![](image.png)`) are **not** uploaded automatically — upload them and reference them by DAM path.
 
 ---
 
@@ -282,6 +284,60 @@ cf-agent asset exists /content/dam/marketplace/logos/workday.svg
 
 ---
 
+## Uploading assets
+
+`asset upload` puts a local file into the AEM DAM, so logos and content-guide images no longer have to be uploaded by hand in AEM.
+
+### One-time setup
+
+Store your AWS credentials once — they are used to stage the file (see [How it works](#how-it-works) below). Ask the team for a key; it will be sent to you securely.
+
+```bash
+cf-agent asset credentials set
+```
+
+You are prompted for both values. The secret is hidden as you paste it, so it never lands in your shell history.
+
+```bash
+cf-agent asset credentials show    # confirm they're stored (never prints the secret)
+cf-agent asset credentials clear   # remove them
+```
+
+Credentials are kept in your **OS keychain** — macOS Keychain, Windows Credential Manager, or the Linux Secret Service — encrypted at rest, never in a plaintext file and never in the repo. Nothing else needs configuring: the staging bucket, region and prefix ship with the CLI.
+
+### Upload
+
+```bash
+# Into the marketplace logos folder
+cf-agent asset upload ./workday.svg --logo
+
+# Into the marketplace images folder
+cf-agent asset upload ./screenshot.png --image
+
+# Into any DAM folder
+cf-agent asset upload ./diagram.png --root /content/dam/marketplace/screenshots
+
+# Rename on the way in
+cf-agent asset upload ./local-name.png --logo --name workday.svg
+```
+
+On success it prints the DAM path and `assetId`:
+
+```
+✓ Uploaded: /content/dam/marketplace/logos/workday.svg
+  assetId: urn:aaid:aem:d3fc8f49-4c8f-49ee-b01f-3f00999201b0
+```
+
+Use that `/content/dam/...` path directly as a `logo` value or in content-guide markdown. Add `--json` for scripting.
+
+### How it works
+
+AEM's Assets API cannot accept a binary directly from your user token — it can only *pull* an asset from a URL. So the CLI uploads the file to an S3 staging bucket, hands AEM a short-lived pre-signed URL to fetch it from, waits for the import to finish, then deletes the staged copy. This is why AWS credentials are needed at all; the staged object is temporary and removed automatically.
+
+> **Credential precedence:** `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` environment variables win if set (useful in CI), then the OS keychain, then any `~/.aws` profile. Set nothing and the keychain is used.
+
+---
+
 ## Troubleshooting / Debug
 
 ### Update the CLI to the latest version
@@ -326,8 +382,11 @@ pip install "git+https://github.com/krishnakumar1990/cf-agent.git"
 | `Field 'X' is not editable on update` | Only the editable fields above can change on update. |
 | `Field 'X' cannot be changed after creation` | `slug` / `systems` / `availability` are immutable. |
 | `Slug '…' is already in use` | Choose a unique slug. |
-| `Referenced asset does not exist in AEM` | The logo / a content-guide image isn't in the DAM — upload it first (`cf-agent asset exists …` to check). |
+| `Referenced asset does not exist in AEM` | The logo / a content-guide image isn't in the DAM — upload it with `cf-agent asset upload … --logo` / `--image`, or check with `cf-agent asset exists …`. |
 | `cf-agent: command not found` | The venv isn't active → `source ~/.venvs/cf-agent/bin/activate`. |
+| `Asset upload requires boto3` / `requires 'keyring'` | Your install predates 1.1.0, when these became base dependencies → `pip install --upgrade "git+https://github.com/krishnakumar1990/cf-agent.git"`. |
+| `Could not stage file to S3: access denied` | The AWS key lacks permission on the staging bucket, or none is set → `cf-agent asset credentials show`. |
+| `The staged file isn't readable via its pre-signed URL` | The AWS key can write but not read the staging bucket — it needs `s3:GetObject` too. Ask the team for a corrected key. |
 
 ### Inspect your session
 
