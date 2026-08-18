@@ -293,7 +293,9 @@ def _validate_single_value(cfg: dict, field_def: dict, value: str) -> str:
         if missing:
             listed = "\n  - ".join(missing)
             raise click.ClickException(
-                f"Field '{name}' references AEM asset(s) that do not exist in the DAM:\n  - {listed}"
+                f"Field '{name}' references AEM asset(s) that do not exist in the DAM:\n  - {listed}\n"
+                "\nUpload them with `cf-agent asset upload <file> --image`, or use "
+                "interactive mode (-i), which offers to upload them in place."
             )
 
     if ftype == "boolean" and value.lower() not in ("true", "false"):
@@ -848,7 +850,7 @@ def _effective_content_root(field: dict) -> str:
     return root
 
 
-def _offer_inline_asset_upload(cfg: dict, dam_path: str) -> bool:
+def _offer_inline_asset_upload(cfg: dict, dam_path: str, check_credentials: bool = True) -> bool:
     """A referenced asset is missing — offer to upload it without leaving the form.
 
     Returns True only if the asset now exists at ``dam_path``. Declining, or any
@@ -856,7 +858,9 @@ def _offer_inline_asset_upload(cfg: dict, dam_path: str) -> bool:
 
     The offer is only made when an AWS credential is actually available; without
     one the upload would fail after the user had already picked a file, so we
-    point at the one-time setup instead.
+    point at the one-time setup instead. ``check_credentials=False`` skips that
+    check for callers looping over several assets, which check once up front so
+    the setup guidance is not repeated per asset.
     """
     from . import uploader
 
@@ -864,7 +868,7 @@ def _offer_inline_asset_upload(cfg: dict, dam_path: str) -> bool:
     if not folder or not filename:
         return False
 
-    if not uploader.credentials_available():
+    if check_credentials and not uploader.credentials_available():
         _hint("  You can upload it from here once S3 access is set up:")
         _hint("    cf-agent asset credentials set")
         _hint("  Ask the team for a key, then retry this step.")
@@ -899,6 +903,29 @@ def _offer_inline_asset_upload(cfg: dict, dam_path: str) -> bool:
 
     _success(f"  ✓ Uploaded: {result['dam_path']}")
     return True
+
+
+def _offer_inline_uploads_for_missing(cfg: dict, missing: list[str]) -> list[str]:
+    """Offer an inline upload for each missing DAM asset. Returns those still missing.
+
+    Used for content-guide markdown, which can reference several images at once.
+    Credentials are checked once up front rather than inside each offer, so the
+    setup guidance appears a single time instead of repeating per reference.
+    """
+    from . import uploader
+
+    if not uploader.credentials_available():
+        _hint("  You can upload them from here once S3 access is set up:")
+        _hint("    cf-agent asset credentials set")
+        _hint("  Ask the team for a key, then retry this step.")
+        return list(missing)
+
+    still_missing = []
+    for path in missing:
+        _header(f"\n  Missing: {path}")
+        if not _offer_inline_asset_upload(cfg, path, check_credentials=False):
+            still_missing.append(path)
+    return still_missing
 
 
 @cli.group()
@@ -1374,8 +1401,15 @@ def _prompt_field_value(cfg: dict, field: dict) -> str | None:
                 _failure("  The markdown references AEM asset(s) not found in the DAM:")
                 for p in missing:
                     _failure(f"    - {p}")
-                _hint("  Fix the reference(s) in the file, then re-enter the path.")
-                continue
+                # Offer to upload each one here rather than making the user leave
+                # the form, upload separately, and re-enter the guide.
+                missing = _offer_inline_uploads_for_missing(cfg, missing)
+                if missing:
+                    _hint("  Still missing — fix the reference(s) in the file, or upload them:")
+                    for p in missing:
+                        _hint(f"    - {p}")
+                    _hint("  Then re-enter the path.")
+                    continue
             return content
 
     # All other types — text prompt with hints and validation
