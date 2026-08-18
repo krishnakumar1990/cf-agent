@@ -773,6 +773,25 @@ def login(preset):
 
 
 @cli.command()
+def mcp():
+    """Run the MCP server so an agent can drive cf-agent (stdio transport).
+
+    Exposes the read and create/update operations to any MCP-capable client.
+    Deleting and publishing are deliberately excluded.
+
+    Point your client at:  cf-agent mcp
+    """
+    try:
+        from .mcp_server import main as _mcp_main
+    except ImportError:
+        raise click.ClickException(
+            "The MCP server needs the 'mcp' package. Install it with:\n"
+            "    pip install 'cf-agent[mcp]'   (or: pip install mcp)"
+        )
+    _mcp_main()
+
+
+@cli.command()
 def logout():
     """Clear stored OAuth tokens."""
     config.clear_tokens()

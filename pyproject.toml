@@ -27,6 +27,9 @@ dependencies = [
 # Retained so an existing `pip install 'cf-agent[upload]'` keeps working; the
 # packages it used to pull are part of the base install now.
 upload = []
+# Only needed to run `cf-agent mcp`, which lets an agent drive the CLI. Kept
+# optional so the SDK is not forced on everyone who just uses the CLI.
+mcp = ["mcp>=2.0.0"]
 
 [project.scripts]
 cf-agent = "cf_agent.agent:cli"
