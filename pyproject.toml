@@ -4,9 +4,24 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cf-agent"
-version = "1.1.0"
+version = "1.2.0"
 description = "CLI for managing AEM Content Fragments — Moveworks Marketplace"
+readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "Krishna Selvaraj" }]
+keywords = ["aem", "adobe", "content-fragments", "cli", "marketplace", "mcp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Build Tools",
+]
 dependencies = [
     "httpx>=0.27.0",
     "click>=8.1.0",
@@ -30,6 +45,11 @@ upload = []
 # Only needed to run `cf-agent mcp`, which lets an agent drive the CLI. Kept
 # optional so the SDK is not forced on everyone who just uses the CLI.
 mcp = ["mcp>=2.0.0"]
+
+[project.urls]
+Homepage = "https://github.com/krishnakumar1990/cf-agent"
+Repository = "https://github.com/krishnakumar1990/cf-agent"
+Issues = "https://github.com/krishnakumar1990/cf-agent/issues"
 
 [project.scripts]
 cf-agent = "cf_agent.agent:cli"
