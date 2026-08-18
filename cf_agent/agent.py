@@ -848,6 +848,59 @@ def _effective_content_root(field: dict) -> str:
     return root
 
 
+def _offer_inline_asset_upload(cfg: dict, dam_path: str) -> bool:
+    """A referenced asset is missing — offer to upload it without leaving the form.
+
+    Returns True only if the asset now exists at ``dam_path``. Declining, or any
+    failure, returns False so the caller re-prompts for a different name.
+
+    The offer is only made when an AWS credential is actually available; without
+    one the upload would fail after the user had already picked a file, so we
+    point at the one-time setup instead.
+    """
+    from . import uploader
+
+    folder, _, filename = dam_path.rpartition("/")
+    if not folder or not filename:
+        return False
+
+    if not uploader.credentials_available():
+        _hint("  You can upload it from here once S3 access is set up:")
+        _hint("    cf-agent asset credentials set")
+        _hint("  Ask the team for a key, then retry this step.")
+        return False
+
+    if not click.confirm(
+        click.style(f"  Upload a local file to create {filename}?", fg="cyan"),
+        default=False,
+    ):
+        return False
+
+    while True:
+        local = click.prompt(
+            click.style("  Local file path", fg="cyan"), default="", show_default=False
+        ).strip()
+        if not local or _is_back(local):
+            return False
+        # Strip quotes a drag-and-drop into the terminal often adds.
+        local_path = Path(local.strip("'\"")).expanduser()
+        if local_path.is_file():
+            break
+        _failure(f"  File not found: {local}")
+
+    try:
+        result = uploader.stage_and_import(
+            cfg, str(local_path), folder, filename,
+            on_status=lambda m: _hint(f"  {m}"),
+        )
+    except click.ClickException as exc:
+        _failure(f"  Upload failed: {exc.format_message()}")
+        return False
+
+    _success(f"  ✓ Uploaded: {result['dam_path']}")
+    return True
+
+
 @cli.group()
 def asset():
     """Check and upload assets in the AEM DAM."""
@@ -1382,8 +1435,12 @@ def _prompt_field_value(cfg: dict, field: dict) -> str | None:
             # Verify the asset exists in AEM now, so a typo can be corrected in
             # place instead of failing after the whole form is filled in.
             if not _asset_exists(cfg, value):
-                _failure(f"  Asset not found in AEM: {value}. Please enter a valid asset name.")
-                continue
+                _failure(f"  Asset not found in AEM: {value}")
+                # Offer to upload it inline rather than making the user abandon
+                # the form, upload separately, and start over.
+                if not _offer_inline_asset_upload(cfg, value):
+                    _hint("  Enter a different asset name, or :back to go back.")
+                    continue
             # Inline one-to-one logo check: re-prompt here rather than failing at the end.
             uniq_folder = field.get("_uniqueness_folder")
             if uniq_folder:

@@ -126,6 +126,27 @@ def _resolve_credentials() -> dict:
     return {}
 
 
+def credentials_available() -> bool:
+    """True if some AWS credential source is usable, without making a network call.
+
+    Used to decide whether to *offer* an upload (e.g. inline from the fragment
+    form). Cheap and offline: it confirms a credential exists, not that it has
+    the right permissions — the upload itself surfaces that, with a clearer
+    message than a preflight could give here.
+    """
+    if _resolve_credentials():
+        return True
+    try:
+        import boto3
+    except ImportError:
+        return False
+    try:
+        # Covers a ~/.aws profile, SSO, or an instance role.
+        return boto3.Session().get_credentials() is not None
+    except Exception:
+        return False
+
+
 def _s3_client(stg: dict):
     try:
         import boto3  # imported lazily so the CLI works without boto3 installed
