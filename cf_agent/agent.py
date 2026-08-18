@@ -924,6 +924,70 @@ def _offer_inline_asset_upload(cfg: dict, dam_path: str, check_credentials: bool
     return True
 
 
+def _slug_image_folder(slug: str) -> str:
+    """DAM folder holding one fragment's content-guide images."""
+    return f"{IMAGE_ROOT}/{slug.strip('/')}"
+
+
+def _relocate_guide_images(cfg: dict, content: str, missing: list[str],
+                           slug: str) -> tuple[str, list[str]]:
+    """Upload a guide's missing images into /images/<slug>/ and repoint the markdown.
+
+    Historically every guide image landed flat in /images, so hundreds of files
+    from different connectors share one folder with names like Untitled_203.png.
+    Filing them per slug keeps a fragment's images together and stops one
+    author's export colliding with another's.
+
+    Authors still write whatever path they like; the reference is rewritten to
+    the slug folder as each image is uploaded, so the stored guide always points
+    at the file that was actually created. Returns the (possibly rewritten)
+    content and the references still missing.
+    """
+    from . import uploader
+
+    if not uploader.credentials_available():
+        _hint("  You can upload them from here once S3 access is set up:")
+        _hint("    cf-agent asset credentials set")
+        _hint("  Ask the team for a key, then retry this step.")
+        return content, list(missing)
+
+    folder = _slug_image_folder(slug)
+    still_missing: list[str] = []
+    folder_ready = False
+
+    for path in missing:
+        filename = path.rsplit("/", 1)[-1]
+        target = f"{folder}/{filename}"
+
+        # Someone may have uploaded it to the slug folder already — then the only
+        # thing wrong with the guide is the path it points at.
+        if target != path and _asset_exists(cfg, target):
+            content = content.replace(path, target)
+            _success(f"  ✓ Repointed to existing asset: {target}")
+            continue
+
+        _header(f"\n  Missing: {path}")
+        if target != path:
+            _hint(f"  Will upload to {target}")
+
+        if not folder_ready:
+            try:
+                client.create_dam_folder(cfg, folder, title=slug)
+                folder_ready = True
+            except click.ClickException as exc:
+                _failure(f"  Could not create {folder}: {exc.format_message()}")
+                still_missing.append(path)
+                continue
+
+        if _offer_inline_asset_upload(cfg, target, check_credentials=False):
+            if target != path:
+                content = content.replace(path, target)
+        else:
+            still_missing.append(path)
+
+    return content, still_missing
+
+
 def _offer_inline_uploads_for_missing(cfg: dict, missing: list[str]) -> list[str]:
     """Offer an inline upload for each missing DAM asset. Returns those still missing.
 
@@ -1421,8 +1485,14 @@ def _prompt_field_value(cfg: dict, field: dict) -> str | None:
                 for p in missing:
                     _failure(f"    - {p}")
                 # Offer to upload each one here rather than making the user leave
-                # the form, upload separately, and re-enter the guide.
-                missing = _offer_inline_uploads_for_missing(cfg, missing)
+                # the form, upload separately, and re-enter the guide. With a slug
+                # in hand the images are filed under /images/<slug>/ and the guide
+                # is repointed to match; without one, they go where they point.
+                slug = (field.get("_slug") or "").strip()
+                if slug:
+                    content, missing = _relocate_guide_images(cfg, content, missing, slug)
+                else:
+                    missing = _offer_inline_uploads_for_missing(cfg, missing)
                 if missing:
                     _hint("  Still missing — fix the reference(s) in the file, or upload them:")
                     for p in missing:
@@ -1664,8 +1734,13 @@ def _interactive_create(cfg) -> dict:
                     return SKIP
                 return _prompt_with_prev({**field_def, "required": True}, prev)
             # content_guide is mandatory on create — prompt as required, re-prompt on blank.
+            # The fragment name is the slug, and is collected before any model
+            # field, so guide images can be filed under /images/<slug>/.
             if fname in REQUIRED_ON_CREATE:
-                return _prompt_with_prev({**field_def, "required": True}, prev)
+                return _prompt_with_prev(
+                    {**field_def, "required": True, "_slug": answers.get("__name") or ""},
+                    prev,
+                )
             # logo: validate one-to-one uniqueness inline (before the next step).
             if fname == "logo":
                 return _prompt_with_prev({**field_def, "_uniqueness_folder": parent_path}, prev)

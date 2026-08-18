@@ -112,6 +112,57 @@ def _assets_base_url(cfg: dict) -> str:
     return sites_url.rstrip("/").replace("/adobe/sites", "/adobe/assets", 1)
 
 
+def create_dam_folder(cfg: dict, folder_path: str, title: str = None) -> None:
+    """Create a DAM folder, treating "already exists" as success.
+
+    AEM's asset import refuses to create intermediate folders — importing into a
+    path that does not exist fails with "Cannot resolve folder" — so a folder has
+    to be made before anything can be uploaded into it.
+
+    The endpoint takes an array of folders and always answers 200, reporting
+    per-folder outcomes in the body: an existing folder comes back under
+    ``failedFolders`` as a Conflict, which is the idempotent case we want to
+    ignore. Any other failure is raised.
+    """
+    token = auth.get_token(cfg)
+    assets_base = _assets_base_url(cfg)
+    if not assets_base:
+        raise click.ClickException(
+            "Could not derive the AEM API URL from the selected environment."
+        )
+    host = assets_base.split("/adobe/")[0]
+
+    path = folder_path.rstrip("/")
+    try:
+        resp = httpx.post(
+            f"{host}/adobe/folders",
+            json=[{"path": path, "title": title or path.rsplit("/", 1)[-1]}],
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "X-Adobe-Accept-Experimental": "1",
+            },
+            timeout=30,
+        )
+    except httpx.HTTPError as exc:
+        raise click.ClickException(f"Could not create DAM folder '{path}': {exc}")
+
+    if resp.is_error:
+        raise click.ClickException(_format_error(resp, "POST", f"{host}/adobe/folders"))
+
+    failures = (
+        resp.json().get("data", {}).get("values", {}).get("failedFolders", [])
+    )
+    for f in failures:
+        # A Conflict means the folder is already there — exactly what we wanted.
+        if "conflict" in str(f.get("type", "")).lower():
+            continue
+        raise click.ClickException(
+            f"Could not create DAM folder '{path}': "
+            f"{f.get('detail') or f.get('title') or 'unknown error'}"
+        )
+
+
 def resource_exists(cfg: dict, resource_path: str) -> bool:
     """Check whether an author-tier AEM DAM asset exists.
 
