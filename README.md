@@ -50,11 +50,13 @@ python3 -m venv ~/.venvs/cf-agent
 source ~/.venvs/cf-agent/bin/activate
 
 # 2. Install cf-agent
-pip install "git+https://github.com/krishnakumar1990/cf-agent.git"
+pip install "cf-agent[mcp]"
 
 # 3. Verify
 cf-agent --help
 ```
+
+The `[mcp]` part adds the server that lets [Claude drive cf-agent](#using-cf-agent-from-claude). Plain `pip install cf-agent` gives you the CLI on its own.
 
 **New terminal later?** Re-activate first: `source ~/.venvs/cf-agent/bin/activate`
 To auto-activate in every shell: `echo 'source ~/.venvs/cf-agent/bin/activate' >> ~/.zshrc`
@@ -442,7 +444,7 @@ Everything written is validated against the live AEM model first, exactly as the
 
 ```bash
 source ~/.venvs/cf-agent/bin/activate
-pip install --upgrade "git+https://github.com/krishnakumar1990/cf-agent.git"
+pip install --upgrade "cf-agent[mcp]"
 cf-agent --help        # confirm it still runs
 ```
 
@@ -455,7 +457,7 @@ source ~/.venvs/cf-agent/bin/activate
 pip uninstall cf-agent
 
 # reinstall (fresh copy)
-pip install "git+https://github.com/krishnakumar1990/cf-agent.git"
+pip install "cf-agent[mcp]"
 ```
 
 For a completely clean slate, delete and recreate the virtual environment:
@@ -465,7 +467,7 @@ deactivate 2>/dev/null
 rm -rf ~/.venvs/cf-agent
 python3 -m venv ~/.venvs/cf-agent
 source ~/.venvs/cf-agent/bin/activate
-pip install "git+https://github.com/krishnakumar1990/cf-agent.git"
+pip install "cf-agent[mcp]"
 ```
 
 > Uninstalling does **not** remove your login. Config and tokens live in `~/.cf-agent/` — delete that folder to fully reset (`rm -rf ~/.cf-agent`), then `cf-agent login` again.
@@ -482,7 +484,7 @@ pip install "git+https://github.com/krishnakumar1990/cf-agent.git"
 | `Slug '…' is already in use` | Choose a unique slug. |
 | `Referenced asset does not exist in AEM` | The logo / a content-guide image isn't in the DAM — upload it with `cf-agent asset upload … --logo` / `--image`, or check with `cf-agent asset exists …`. |
 | `cf-agent: command not found` | The venv isn't active → `source ~/.venvs/cf-agent/bin/activate`. |
-| `Asset upload requires boto3` / `requires 'keyring'` | Your install predates 1.1.0, when these became base dependencies → `pip install --upgrade "git+https://github.com/krishnakumar1990/cf-agent.git"`. |
+| `Asset upload requires boto3` / `requires 'keyring'` | Your install predates 1.1.0, when these became base dependencies → `pip install --upgrade "cf-agent[mcp]"`. |
 | `Could not stage file to S3: access denied` | The AWS key lacks permission on the staging bucket, or none is set → `cf-agent asset credentials show`. |
 | `The staged file isn't readable via its pre-signed URL` | The AWS key can write but not read the staging bucket — it needs `s3:GetObject` too. Ask the team for a corrected key. |
 | `No image files found directly in …` | The folder has no recognised images at its top level — nested folders aren't walked. |
