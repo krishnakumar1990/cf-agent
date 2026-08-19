@@ -924,6 +924,70 @@ def _offer_inline_asset_upload(cfg: dict, dam_path: str, check_credentials: bool
     return True
 
 
+def _slug_image_folder(slug: str) -> str:
+    """DAM folder holding one fragment's content-guide images."""
+    return f"{IMAGE_ROOT}/{slug.strip('/')}"
+
+
+def _relocate_guide_images(cfg: dict, content: str, missing: list[str],
+                           slug: str) -> tuple[str, list[str]]:
+    """Upload a guide's missing images into /images/<slug>/ and repoint the markdown.
+
+    Historically every guide image landed flat in /images, so hundreds of files
+    from different connectors share one folder with names like Untitled_203.png.
+    Filing them per slug keeps a fragment's images together and stops one
+    author's export colliding with another's.
+
+    Authors still write whatever path they like; the reference is rewritten to
+    the slug folder as each image is uploaded, so the stored guide always points
+    at the file that was actually created. Returns the (possibly rewritten)
+    content and the references still missing.
+    """
+    from . import uploader
+
+    if not uploader.credentials_available():
+        _hint("  You can upload them from here once S3 access is set up:")
+        _hint("    cf-agent asset credentials set")
+        _hint("  Ask the team for a key, then retry this step.")
+        return content, list(missing)
+
+    folder = _slug_image_folder(slug)
+    still_missing: list[str] = []
+    folder_ready = False
+
+    for path in missing:
+        filename = path.rsplit("/", 1)[-1]
+        target = f"{folder}/{filename}"
+
+        # Someone may have uploaded it to the slug folder already — then the only
+        # thing wrong with the guide is the path it points at.
+        if target != path and _asset_exists(cfg, target):
+            content = content.replace(path, target)
+            _success(f"  ✓ Repointed to existing asset: {target}")
+            continue
+
+        _header(f"\n  Missing: {path}")
+        if target != path:
+            _hint(f"  Will upload to {target}")
+
+        if not folder_ready:
+            try:
+                client.create_dam_folder(cfg, folder, title=slug)
+                folder_ready = True
+            except click.ClickException as exc:
+                _failure(f"  Could not create {folder}: {exc.format_message()}")
+                still_missing.append(path)
+                continue
+
+        if _offer_inline_asset_upload(cfg, target, check_credentials=False):
+            if target != path:
+                content = content.replace(path, target)
+        else:
+            still_missing.append(path)
+
+    return content, still_missing
+
+
 def _offer_inline_uploads_for_missing(cfg: dict, missing: list[str]) -> list[str]:
     """Offer an inline upload for each missing DAM asset. Returns those still missing.
 
@@ -952,35 +1016,59 @@ def asset():
     """Check and upload assets in the AEM DAM."""
 
 
+# Extensions treated as uploadable images when a folder is given. Anything else
+# in the folder (.DS_Store, notes.txt, .sketch source files) is left alone.
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp", ".tif", ".tiff"}
+
+
+def _image_files_in(folder: Path) -> list[Path]:
+    """Image files directly inside ``folder``, sorted. Not recursive.
+
+    Deliberately top-level only — recursing would sweep in unrelated images from
+    nested export folders the user did not mean to publish.
+    """
+    return sorted(
+        p for p in folder.iterdir()
+        if p.is_file() and p.suffix.lower() in _IMAGE_EXTENSIONS
+    )
+
+
 @asset.command("upload")
-@click.argument("local_file", type=click.Path(exists=True, dir_okay=False))
+@click.argument("local_path", type=click.Path(exists=True))
 @click.option("--logo", is_flag=True, help=f"Upload into the marketplace logos folder ({LOGO_ROOT}).")
 @click.option("--image", is_flag=True, help=f"Upload into the marketplace images folder ({IMAGE_ROOT}).")
+@click.option("--slug", default=None, metavar="SLUG", help=f"Upload into this fragment's own image folder ({IMAGE_ROOT}/<slug>). Created if needed.")
 @click.option("--root", default=None, metavar="DAM_PATH", help="Destination DAM folder (e.g. /content/dam/marketplace/screenshots).")
-@click.option("--name", "dest_name", default=None, help="File name to use in the DAM (defaults to the local file name).")
+@click.option("--name", "dest_name", default=None, help="File name to use in the DAM (single file only; defaults to the local name).")
+@click.option("--overwrite", is_flag=True, help="Re-upload files that already exist in the destination (default: skip them).")
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON")
-def asset_upload(local_file, logo, image, root, dest_name, as_json):
-    """Upload a local file into the AEM DAM via an S3 staging hop.
+def asset_upload(local_path, logo, image, slug, root, dest_name, overwrite, as_json):
+    """Upload a local file — or every image in a local folder — into the AEM DAM.
 
-    The file is uploaded to the S3 staging bucket, a short-lived pre-signed GET
-    URL is generated, and AEM is asked to pull the asset from that URL.
+    Pass a file to upload one asset, or a folder to upload all the images in it
+    (top level only). With --slug they land in this fragment's own folder,
+    which is created if it does not exist:
 
-    The staged S3 object is deleted once the import finishes.
+        cf-agent asset upload ./logo.svg --logo
+        cf-agent asset upload ~/Desktop/acme-shots --slug acme
 
-    The staging bucket, region and prefix ship with the app — there is nothing to
-    configure. Set AWS_S3_STAGING_BUCKET / _REGION / _PREFIX (env var or
-    ~/.cf-agent/config) only to point at a different environment. The prefix must
-    stay inside aem-assets/, the only prefix the CLI's IAM user may delete from.
+    Files already present in the destination are skipped unless --overwrite is
+    given, so re-running after a partial upload only sends what is missing.
 
-    AWS credentials come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY, the OS
-    keychain (`cf-agent asset credentials set`), or boto3's own chain.
+    Each file is staged to S3, pulled into AEM from a short-lived pre-signed URL,
+    and the staged copy deleted. The staging bucket ships with the app; set
+    AWS_S3_STAGING_BUCKET / _REGION / _PREFIX only to point at another
+    environment. Credentials come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY,
+    the OS keychain (`cf-agent asset credentials set`), or boto3's own chain.
     """
     from . import uploader
 
-    if sum(bool(x) for x in (logo, image, root)) > 1:
-        raise click.ClickException("Use only one of --logo, --image, or --root.")
+    if sum(bool(x) for x in (logo, image, root, slug)) > 1:
+        raise click.ClickException("Use only one of --logo, --image, --slug, or --root.")
 
-    if root:
+    if slug:
+        dam_folder = _slug_image_folder(slug)
+    elif root:
         dam_folder = root.rstrip("/")
     elif logo:
         dam_folder = LOGO_ROOT
@@ -988,22 +1076,76 @@ def asset_upload(local_file, logo, image, root, dest_name, as_json):
         dam_folder = IMAGE_ROOT
     else:
         raise click.ClickException(
-            "Choose a destination folder with --logo, --image, or --root."
+            "Choose a destination with --slug, --logo, --image, or --root."
         )
 
+    source = Path(local_path).expanduser()
     cfg = _cfg()
-    on_status = None if as_json else lambda m: _hint(f"  {m}")
+    on_status = None if as_json else lambda m: _hint(f"    {m}")
 
-    result = uploader.stage_and_import(
-        cfg, local_file, dam_folder, dest_name, on_status=on_status
-    )
+    # ── single file ───────────────────────────────────────────────────────────
+    if source.is_file():
+        if slug:
+            client.create_dam_folder(cfg, dam_folder, title=slug)
+        result = uploader.stage_and_import(
+            cfg, str(source), dam_folder, dest_name, on_status=on_status
+        )
+        if as_json:
+            _print_json(result)
+        else:
+            _success(f"✓ Uploaded: {result['dam_path']}")
+            if result.get("asset_id"):
+                _hint(f"  assetId: {result['asset_id']}")
+        return
+
+    # ── folder ────────────────────────────────────────────────────────────────
+    if dest_name:
+        raise click.ClickException("--name applies to a single file, not a folder.")
+
+    files = _image_files_in(source)
+    if not files:
+        raise click.ClickException(
+            f"No image files found directly in {source}. "
+            f"Looked for: {', '.join(sorted(_IMAGE_EXTENSIONS))}"
+        )
+
+    if slug:
+        client.create_dam_folder(cfg, dam_folder, title=slug)
+
+    if not as_json:
+        _header(f"\nUploading {len(files)} image(s) to {dam_folder}")
+
+    uploaded, skipped, failed = [], [], []
+    for f in files:
+        target = f"{dam_folder}/{f.name}"
+        if not overwrite and client.resource_exists(cfg, target):
+            skipped.append(target)
+            if not as_json:
+                _hint(f"  – {f.name} — already in AEM, skipped")
+            continue
+        if not as_json:
+            click.echo(f"  · {f.name}")
+        try:
+            r = uploader.stage_and_import(cfg, str(f), dam_folder, f.name, on_status=on_status)
+            uploaded.append(r["dam_path"])
+        except click.ClickException as exc:
+            failed.append({"file": f.name, "error": exc.format_message()})
+            if not as_json:
+                _failure(f"    failed: {exc.format_message()}")
 
     if as_json:
-        _print_json(result)
+        _print_json({"folder": dam_folder, "uploaded": uploaded,
+                     "skipped": skipped, "failed": failed})
     else:
-        _success(f"✓ Uploaded: {result['dam_path']}")
-        if result.get("asset_id"):
-            _hint(f"  assetId: {result['asset_id']}")
+        click.echo()
+        _success(f"✓ {len(uploaded)} uploaded to {dam_folder}")
+        if skipped:
+            _hint(f"  {len(skipped)} already present (use --overwrite to replace)")
+        if failed:
+            _failure(f"  {len(failed)} failed")
+
+    if failed:
+        raise SystemExit(1)
 
 
 @asset.group("credentials")
@@ -1421,8 +1563,14 @@ def _prompt_field_value(cfg: dict, field: dict) -> str | None:
                 for p in missing:
                     _failure(f"    - {p}")
                 # Offer to upload each one here rather than making the user leave
-                # the form, upload separately, and re-enter the guide.
-                missing = _offer_inline_uploads_for_missing(cfg, missing)
+                # the form, upload separately, and re-enter the guide. With a slug
+                # in hand the images are filed under /images/<slug>/ and the guide
+                # is repointed to match; without one, they go where they point.
+                slug = (field.get("_slug") or "").strip()
+                if slug:
+                    content, missing = _relocate_guide_images(cfg, content, missing, slug)
+                else:
+                    missing = _offer_inline_uploads_for_missing(cfg, missing)
                 if missing:
                     _hint("  Still missing — fix the reference(s) in the file, or upload them:")
                     for p in missing:
@@ -1664,8 +1812,13 @@ def _interactive_create(cfg) -> dict:
                     return SKIP
                 return _prompt_with_prev({**field_def, "required": True}, prev)
             # content_guide is mandatory on create — prompt as required, re-prompt on blank.
+            # The fragment name is the slug, and is collected before any model
+            # field, so guide images can be filed under /images/<slug>/.
             if fname in REQUIRED_ON_CREATE:
-                return _prompt_with_prev({**field_def, "required": True}, prev)
+                return _prompt_with_prev(
+                    {**field_def, "required": True, "_slug": answers.get("__name") or ""},
+                    prev,
+                )
             # logo: validate one-to-one uniqueness inline (before the next step).
             if fname == "logo":
                 return _prompt_with_prev({**field_def, "_uniqueness_folder": parent_path}, prev)

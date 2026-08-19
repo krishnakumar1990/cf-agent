@@ -13,7 +13,10 @@ Create, edit, publish, and inspect fragments across **PROD / STAGE / DEV** with 
 - **Edit without a UUID** — find and select a fragment by model + name filter, or by slug.
 - **Live validation** against the model: required fields, enums, max-length, regex, kebab-case slugs, duplicate-slug detection, and cross-field rules.
 - **Content guides from markdown files**, with automatic checking that every referenced AEM image exists.
-- **Upload assets straight from your machine** (`asset upload`) — logos and content-guide images go into the DAM without opening AEM.
+- **Upload assets straight from your machine** (`asset upload`) — one file, or every image in a folder, into the DAM without opening AEM.
+- **Missing images offered inline** — when a guide references an image that isn't in AEM yet, upload it without leaving the form.
+- **Per-fragment image folders** — a fragment's guide images are filed under `images/<slug>/` instead of one shared folder.
+- **Drive it from Claude** (`cf-agent mcp`) — ask for fragments in plain language, with the same validation the CLI enforces.
 - **Smart defaults** — logo/asset folders auto-prefixed, plugin slugs seeded with the system name, model folders chosen automatically.
 - **Guardrails** — immutable fields and review-locked fragments are caught up front, not after you fill in a form.
 - **Command history** — ↑/↓ recall previous entries in interactive prompts.
@@ -32,6 +35,7 @@ Create, edit, publish, and inspect fragments across **PROD / STAGE / DEV** with 
 - [Other fragment commands](#other-fragment-commands)
 - [Models & assets](#models--assets)
 - [Uploading assets](#uploading-assets)
+- [Using cf-agent from Claude](#using-cf-agent-from-claude)
 - [Troubleshooting / Debug](#troubleshooting--debug)
 
 ---
@@ -236,7 +240,24 @@ Only these fields can be changed on update — everything else is locked.
 
 When you provide the file, the CLI reads it and **verifies every AEM image it references exists**. It checks `/content/dam/...` paths in markdown images `![](…)`, links `[](…)`, and HTML `<img src="…">` (full AEM URLs too). If any referenced image is missing, the operation is blocked and the missing paths are listed.
 
-**Workflow for images:** upload the image to AEM first — `cf-agent asset upload ./shot.png --image` (see [Uploading assets](#uploading-assets)) or by hand in AEM — reference it by the `/content/dam/...` path it returns, then create/update the guide. Relative image paths from a raw export (e.g. `![](image.png)`) are **not** uploaded automatically — upload them and reference them by DAM path.
+**Missing images are offered inline.** In interactive mode, if the guide references an image that isn't in the DAM yet, the CLI asks for the local file and uploads it without you leaving the form:
+
+```
+  The markdown references AEM asset(s) not found in the DAM:
+    - /content/dam/marketplace/images/shot.png
+
+  Missing: /content/dam/marketplace/images/shot.png
+  Will upload to /content/dam/marketplace/images/workday/shot.png
+  Upload a local file to create shot.png? [y/N]: y
+  Local file path: ~/Desktop/shot.png
+  ✓ Uploaded: /content/dam/marketplace/images/workday/shot.png
+```
+
+When creating a fragment, images are filed under the fragment's own slug folder and the guide is repointed to match — so you can keep writing whatever path suits you and the stored guide always points at the file that was actually created. Uploading several? Do them in one go first with `cf-agent asset upload <folder> --slug <slug>`, then the guide validates cleanly.
+
+This needs AWS credentials ([one-time setup](#one-time-setup)). Without them the CLI explains the setup instead of offering. You can always upload separately or by hand in AEM and reference the `/content/dam/...` path yourself.
+
+Relative image paths from a raw export (e.g. `![](image.png)`) are **not** picked up — reference images by DAM path.
 
 ---
 
@@ -305,20 +326,23 @@ cf-agent asset credentials clear   # remove them
 
 Credentials are kept in your **OS keychain** — macOS Keychain, Windows Credential Manager, or the Linux Secret Service — encrypted at rest, never in a plaintext file and never in the repo. Nothing else needs configuring: the staging bucket, region and prefix ship with the CLI.
 
-### Upload
+### Upload one file
 
 ```bash
 # Into the marketplace logos folder
 cf-agent asset upload ./workday.svg --logo
 
-# Into the marketplace images folder
+# Into a fragment's own image folder — /content/dam/marketplace/images/<slug>/
+cf-agent asset upload ./screenshot.png --slug workday
+
+# Into the shared images folder
 cf-agent asset upload ./screenshot.png --image
 
 # Into any DAM folder
 cf-agent asset upload ./diagram.png --root /content/dam/marketplace/screenshots
 
 # Rename on the way in
-cf-agent asset upload ./local-name.png --logo --name workday.svg
+cf-agent asset upload ./Untitled_204.png --slug workday --name workflow-diagram.png
 ```
 
 On success it prints the DAM path and `assetId`:
@@ -330,11 +354,85 @@ On success it prints the DAM path and `assetId`:
 
 Use that `/content/dam/...` path directly as a `logo` value or in content-guide markdown. Add `--json` for scripting.
 
+### Upload a whole folder
+
+Point at a folder instead of a file and every image inside it is uploaded. Guide screenshots usually come out of an export tool together, so this is the quickest way to seed a fragment's images:
+
+```bash
+cf-agent asset upload ~/Desktop/workday-shots --slug workday
+```
+
+```
+Uploading 3 image(s) to /content/dam/marketplace/images/workday
+  · shot-1.png
+  · shot-2.png
+  · shot-3.png
+
+✓ 3 uploaded to /content/dam/marketplace/images/workday
+```
+
+- **Top level only** — nested folders are not walked.
+- **Images only** — `.png .jpg .jpeg .gif .svg .webp .bmp .tif .tiff`. A stray `notes.txt` or `.DS_Store` is ignored.
+- **Already-uploaded files are skipped**, so re-running after a partial upload sends only what's missing. Use `--overwrite` to replace them.
+- **One bad file doesn't stop the batch** — it's reported and the rest continue; the command exits non-zero if anything failed.
+
+`--name` applies to a single file only, since one name can't cover many files.
+
+### Where images live
+
+Each fragment's content-guide images belong in its own folder, named for the slug:
+
+```
+/content/dam/marketplace/images/<slug>/
+```
+
+The folder is created automatically the first time you upload into it. Logos stay in the shared `logos` folder.
+
+> Fragments created before this convention have their images in the flat `images` folder. Those still work — nothing was moved.
+
 ### How it works
 
 AEM's Assets API cannot accept a binary directly from your user token — it can only *pull* an asset from a URL. So the CLI uploads the file to an S3 staging bucket, hands AEM a short-lived pre-signed URL to fetch it from, waits for the import to finish, then deletes the staged copy. This is why AWS credentials are needed at all; the staged object is temporary and removed automatically.
 
 > **Credential precedence:** `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` environment variables win if set (useful in CI), then the OS keychain, then any `~/.aws` profile. Set nothing and the keychain is used.
+
+---
+
+## Using cf-agent from Claude
+
+`cf-agent mcp` runs an MCP server, so Claude Desktop (or any MCP client) can carry out these operations for you — listing fragments, checking fields, creating and updating content, uploading assets — from a plain-language request.
+
+```bash
+pip install "cf-agent[mcp]"
+```
+
+Then add it to your Claude Desktop config — **Settings → Developer → Edit Config**, or edit the file directly:
+
+| | |
+|---|---|
+| macOS | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| Windows | `%APPDATA%\Claude\claude_desktop_config.json` |
+
+```json
+{
+  "mcpServers": {
+    "cf-agent": {
+      "command": "/Users/you/.venvs/cf-agent/bin/cf-agent",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Use the **absolute path** — run `which cf-agent` (macOS) or `where cf-agent` (Windows) to get it. Claude Desktop doesn't inherit your shell `PATH` or activated venv. On Windows, double the backslashes in JSON. Then quit Claude Desktop completely (⌘Q, or Quit from the Windows tray) and reopen.
+
+**What it can do:** read operations (`list_fragments`, `get_fragment`, `search_fragments`, `list_models`, `get_model_schema`, `list_variations`, `asset_exists`) and write operations (`create_fragment`, `update_fragment`, `copy_fragment`, `upload_asset`).
+
+**What it can't:** deleting and publishing are deliberately excluded — both are permanent or externally visible, so they stay a deliberate action at the command line.
+
+Everything written is validated against the live AEM model first, exactly as the CLI does, so an agent can't create a fragment the CLI would have rejected.
+
+> Your Adobe sign-in lasts about a day. When it lapses every request reports an expired token — run `cf-agent login` in a terminal; Claude Desktop can't open the browser sign-in for you.
 
 ---
 
@@ -387,6 +485,10 @@ pip install "git+https://github.com/krishnakumar1990/cf-agent.git"
 | `Asset upload requires boto3` / `requires 'keyring'` | Your install predates 1.1.0, when these became base dependencies → `pip install --upgrade "git+https://github.com/krishnakumar1990/cf-agent.git"`. |
 | `Could not stage file to S3: access denied` | The AWS key lacks permission on the staging bucket, or none is set → `cf-agent asset credentials show`. |
 | `The staged file isn't readable via its pre-signed URL` | The AWS key can write but not read the staging bucket — it needs `s3:GetObject` too. Ask the team for a corrected key. |
+| `No image files found directly in …` | The folder has no recognised images at its top level — nested folders aren't walked. |
+| `--name applies to a single file, not a folder` | Drop `--name`; one name can't cover a batch. |
+| `Cannot resolve folder …` | The destination DAM folder doesn't exist. `--slug` creates it for you; `--root` does not. |
+| No cf-agent tools in Claude Desktop | Quit the app fully (⌘Q, or Quit from the Windows tray) and reopen. Check the config is valid JSON and the command path is absolute. |
 
 ### Inspect your session
 
