@@ -42,8 +42,9 @@ Create, edit, publish, and inspect fragments across **PROD / STAGE / DEV** with 
 
 ## Getting started
 
-Five steps, about five minutes. Nothing here touches your system Python or any other
-project — see [Will this affect my other Python projects?](#will-this-affect-my-other-python-projects)
+Six steps, about five minutes. Everything lives in one folder you create in step 1,
+so nothing touches your system Python or any other project — see
+[Will this affect my other Python projects?](#will-this-affect-my-other-python-projects)
 below.
 
 ### 1. Create your workspace
@@ -62,59 +63,56 @@ cd ~/marketplace-content
 | `guides/` | Markdown content guides you pass to `-f content_guide=...` |
 | `images/` | Screenshots and logos you upload with `cf-agent asset upload` |
 
-Run cf-agent from this folder and the paths in the examples below work as written. The
-name and location are yours to choose — cf-agent never writes into this folder on its
-own, and never reads from it unless you name a file.
+This folder is your workspace. The virtual environment goes inside it in the next
+step, so one folder ends up holding cf-agent and everything you feed it. Run cf-agent
+from here and the paths in the examples below work as written.
 
-### 2. Install cf-agent
+The name and location are yours to choose — cf-agent never writes into this folder on
+its own, and never reads from it unless you name a file.
 
-Requires **Python 3.10+**. Install with [pipx](https://pipx.pypa.io), which gives the
-tool an isolated environment of its own and puts the `cf-agent` command on your `PATH`:
+### 2. Create a virtual environment inside it
+
+Requires **Python 3.10+**. From inside the folder you just made, create the
+environment cf-agent will live in and activate it:
 
 ```bash
-# macOS
-brew install pipx && pipx ensurepath
-
-# Windows / Linux
-python3 -m pip install --user pipx && python3 -m pipx ensurepath
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 ```
 
-Open a new terminal so `PATH` takes effect, then:
+Your prompt gains a `(.venv)` prefix. That prefix is how you know the environment is
+active — it is worth glancing at before you install anything.
+
+The environment lives at `~/marketplace-content/.venv`, inside the workspace rather
+than off in a hidden directory, so the whole setup is one folder you can see, back up,
+or delete.
+
+### 3. Install cf-agent
+
+With `(.venv)` showing:
 
 ```bash
-pipx install "cf-agent[mcp]"
-cf-agent --help
-```
-
-The `[mcp]` part adds the server that lets [Claude drive cf-agent](#using-cf-agent-from-claude).
-Plain `pipx install cf-agent` gives you the CLI on its own.
-
-There is no environment to activate — `cf-agent` works in any terminal, from any
-folder, straight away.
-
-<details>
-<summary><b>No pipx?</b> Install into a virtual environment instead</summary>
-
-On a managed machine where pipx can't be installed, a dedicated virtual environment
-gives you the same isolation, at the cost of having to activate it each session:
-
-```bash
-python3 -m venv ~/.venvs/cf-agent
-source ~/.venvs/cf-agent/bin/activate
 pip install "cf-agent[mcp]"
 cf-agent --help
 ```
 
-Every new terminal needs `source ~/.venvs/cf-agent/bin/activate` first.
+The `[mcp]` part adds the server that lets [Claude drive cf-agent](#using-cf-agent-from-claude).
+Plain `pip install cf-agent` gives you the CLI on its own.
 
-Do **not** add that line to `~/.zshrc` or `~/.bashrc`. It would activate cf-agent's
-environment in every shell you open, so the next `pip install` you run for a different
-project would install into cf-agent's environment instead of that project's — exactly
-the conflict the virtual environment is there to prevent.
+**Every new terminal starts the same way** — go to the workspace and activate:
 
-</details>
+```bash
+cd ~/marketplace-content
+source .venv/bin/activate
+```
 
-### 3. Sign in
+Do **not** put that `source` line in `~/.zshrc` or `~/.bashrc`. It would activate
+cf-agent's environment in every shell you open, so the next `pip install` you run for
+a different project would land in cf-agent's environment instead of that project's —
+exactly the conflict this setup exists to prevent. Two lines per session is the price
+of keeping cf-agent out of everything else.
+
+### 4. Sign in
 
 ```bash
 cf-agent login
@@ -123,7 +121,7 @@ cf-agent login
 Adobe IMS OAuth in the browser. See [Authentication](#authentication) for what it
 prompts for and where credentials are stored.
 
-### 4. Pick an environment
+### 5. Pick an environment
 
 ```bash
 cf-agent env select
@@ -132,7 +130,7 @@ cf-agent env select
 This decides which of **PROD / STAGE / DEV** every later command acts on. Start on
 STAGE or DEV while you are finding your feet. See [Environments](#environments).
 
-### 5. Check it works
+### 6. Check it works
 
 A read-only command that proves the install and the login in one go:
 
@@ -146,13 +144,17 @@ You should see the Content Fragment Models — `marketplace-connector`,
 
 ### Will this affect my other Python projects?
 
-No. pipx builds cf-agent a private environment of its own and links only the
-`cf-agent` command onto your `PATH`. Nothing is installed into your system Python,
-your Homebrew or pyenv Python, or any project's virtual environment, and cf-agent's
-dependencies can't collide with another project's — even where you both use different
-versions of the same library.
+No. `pip install` only ever writes into the environment that is currently active, and
+with `(.venv)` showing that is `~/marketplace-content/.venv` — a folder you created
+and can delete. Nothing goes into your system Python, your Homebrew or pyenv Python,
+or any other project's environment, and cf-agent's dependencies can't collide with
+another project's even where you both use different versions of the same library.
 
-Everything cf-agent stores outside that environment is in two places:
+The one way to break that is to `pip install` while the environment is **not** active,
+which is why step 3 says to check for the `(.venv)` prefix and why the `source` line
+must stay out of your shell profile.
+
+Everything cf-agent stores outside the environment is in two places:
 
 | Where | What |
 |---|---|
@@ -162,8 +164,9 @@ Everything cf-agent stores outside that environment is in two places:
 To remove it completely, leaving no trace in any other project:
 
 ```bash
-cf-agent asset credentials clear   # first, to clear the keychain entry
-pipx uninstall cf-agent
+cf-agent asset credentials clear   # first, while cf-agent still exists
+deactivate
+rm -rf ~/marketplace-content/.venv
 rm -rf ~/.cf-agent
 ```
 
@@ -514,10 +517,10 @@ AEM's Assets API cannot accept a binary directly from your user token — it can
 
 `cf-agent mcp` runs an MCP server, so Claude Desktop (or any MCP client) can carry out these operations for you — listing fragments, checking fields, creating and updating content, uploading assets — from a plain-language request.
 
-It ships with the `[mcp]` extra, so if you installed with `pipx install "cf-agent[mcp]"` in [Getting started](#2-install-cf-agent) you already have it. If you installed plain `cf-agent`, add the extra now:
+It ships with the `[mcp]` extra, so if you installed with `pip install "cf-agent[mcp]"` in [Getting started](#3-install-cf-agent) you already have it. If you installed plain `cf-agent`, add the extra now, with the environment active:
 
 ```bash
-pipx install --force "cf-agent[mcp]"
+pip install --upgrade "cf-agent[mcp]"
 ```
 
 Then add it to your Claude Desktop config — **Settings → Developer → Edit Config**, or edit the file directly:
@@ -531,14 +534,14 @@ Then add it to your Claude Desktop config — **Settings → Developer → Edit 
 {
   "mcpServers": {
     "cf-agent": {
-      "command": "/Users/you/.local/bin/cf-agent",
+      "command": "/Users/you/marketplace-content/.venv/bin/cf-agent",
       "args": ["mcp"]
     }
   }
 }
 ```
 
-Use the **absolute path** — run `which cf-agent` (macOS) or `where cf-agent` (Windows) to get it. With pipx this is normally `~/.local/bin/cf-agent`, spelled out in full. Claude Desktop doesn't inherit your shell `PATH`, so a bare `cf-agent` will not resolve. On Windows, double the backslashes in JSON. Then quit Claude Desktop completely (⌘Q, or Quit from the Windows tray) and reopen.
+Use the **absolute path** — with the environment active, run `which cf-agent` (macOS) or `where cf-agent` (Windows) and paste what it prints, with `~` spelled out in full. Claude Desktop inherits neither your shell `PATH` nor an activated environment, so a bare `cf-agent` will not resolve. Pointing straight at the binary inside `.venv` is what makes it work without activation. On Windows the path ends `\.venv\Scripts\cf-agent.exe`, and you double the backslashes in JSON. Then quit Claude Desktop completely (⌘Q, or Quit from the Windows tray) and reopen.
 
 **What it can do:** read operations (`list_fragments`, `get_fragment`, `search_fragments`, `list_models`, `get_model_schema`, `list_variations`, `asset_exists`) and write operations (`create_fragment`, `update_fragment`, `copy_fragment`, `upload_asset`).
 
@@ -552,42 +555,41 @@ Everything written is validated against the live AEM model first, exactly as the
 
 ## Troubleshooting / Debug
 
+Every command here needs the environment active first:
+
+```bash
+cd ~/marketplace-content
+source .venv/bin/activate
+```
+
 ### Update the CLI to the latest version
 
 ```bash
-pipx upgrade cf-agent
+pip install --upgrade "cf-agent[mcp]"
 cf-agent --help        # confirm it still runs
 ```
 
-`pipx upgrade` keeps the `[mcp]` extra you installed with.
+Keep the `[mcp]` part, or the upgrade will drop the MCP server.
 
 ### Uninstall & reinstall
 
 ```bash
-pipx uninstall cf-agent
-pipx install "cf-agent[mcp]"
+pip uninstall cf-agent
+pip install "cf-agent[mcp]"
 ```
 
-`pipx install --force "cf-agent[mcp]"` does both in one step, rebuilding the environment from scratch — that is the clean slate, since the environment pipx manages is thrown away with it.
-
-> Uninstalling does **not** remove your login. Config and tokens live in `~/.cf-agent/` — delete that folder to fully reset (`rm -rf ~/.cf-agent`), then `cf-agent login` again. See [Will this affect my other Python projects?](#will-this-affect-my-other-python-projects) for everything cf-agent stores outside its own environment.
-
-<details>
-<summary>Using the virtual-environment fallback instead of pipx?</summary>
+For a completely clean slate, throw the environment away and build a new one. Your
+guides and images are beside it, not inside it, so they are untouched:
 
 ```bash
-source ~/.venvs/cf-agent/bin/activate
-
-# update
-pip install --upgrade "cf-agent[mcp]"
-
-# uninstall
-pip uninstall cf-agent
+deactivate
+rm -rf ~/marketplace-content/.venv
+python3 -m venv ~/marketplace-content/.venv
+source ~/marketplace-content/.venv/bin/activate
+pip install "cf-agent[mcp]"
 ```
 
-For a clean slate, deactivate, delete `~/.venvs/cf-agent`, then recreate it and reinstall as in [Getting started](#2-install-cf-agent).
-
-</details>
+> Uninstalling does **not** remove your login. Config and tokens live in `~/.cf-agent/` — delete that folder to fully reset (`rm -rf ~/.cf-agent`), then `cf-agent login` again. See [Will this affect my other Python projects?](#will-this-affect-my-other-python-projects) for everything cf-agent stores outside the environment.
 
 ### Common errors
 
@@ -600,8 +602,8 @@ For a clean slate, deactivate, delete `~/.venvs/cf-agent`, then recreate it and 
 | `Field 'X' cannot be changed after creation` | `slug` / `systems` / `availability` are immutable. |
 | `Slug '…' is already in use` | Choose a unique slug. |
 | `Referenced asset does not exist in AEM` | The logo / a content-guide image isn't in the DAM — upload it with `cf-agent asset upload … --logo` / `--image`, or check with `cf-agent asset exists …`. |
-| `cf-agent: command not found` | pipx's bin folder isn't on `PATH` → run `pipx ensurepath` and open a new terminal. On the venv fallback, activate it first: `source ~/.venvs/cf-agent/bin/activate`. |
-| `Asset upload requires boto3` / `requires 'keyring'` | Your install predates 1.1.0, when these became base dependencies → `pipx upgrade cf-agent`. |
+| `cf-agent: command not found` | The environment isn't active — check for the `(.venv)` prefix → `cd ~/marketplace-content && source .venv/bin/activate`. |
+| `Asset upload requires boto3` / `requires 'keyring'` | Your install predates 1.1.0, when these became base dependencies → `pip install --upgrade "cf-agent[mcp]"`. |
 | `Could not stage file to S3: access denied` | The AWS key lacks permission on the staging bucket, or none is set → `cf-agent asset credentials show`. |
 | `The staged file isn't readable via its pre-signed URL` | The AWS key can write but not read the staging bucket — it needs `s3:GetObject` too. Ask the team for a corrected key. |
 | `No image files found directly in …` | The folder has no recognised images at its top level — nested folders aren't walked. |
